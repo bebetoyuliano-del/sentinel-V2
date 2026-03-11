@@ -485,19 +485,6 @@ async function uploadAnalysisToGCS(analysisData: any, metadata: Record<string, a
 
     let url: string | null = null;
 
-    if (GCS_BUCKET === 'MOCK') {
-      // --- MOCK STORAGE LOGIC (for testing in AI Studio) ---
-      const localPath = path.join(process.cwd(), 'public', objectName);
-      const dir = path.dirname(localPath);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(localPath, body);
-      
-      const appUrl = process.env.APP_URL || 'http://localhost:3000';
-      url = `${appUrl}/${objectName}`;
-      console.log("✅ MOCK GCS uploaded:", objectName);
-      return { objectName, url };
-    }
-
     const storage = new Storage(); // gunakan ADC/GOOGLE_APPLICATION_CREDENTIALS
     const bucket = storage.bucket(GCS_BUCKET);
 
@@ -1386,10 +1373,6 @@ function renderDecisionCardsToTelegram(cards: any[], server_enforce: any, global
         
         message += `⏱️ ${timestamp}`;
 
-        if (archiveUrl) {
-          message += `\n🗂️ <b>Archive</b>: ${escapeHtml(archiveUrl)}\n`;
-        }
-
         // 6) Return payload
         const reply_markup = inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : undefined;
         payloads.push({ text: message, reply_markup });
@@ -1437,16 +1420,17 @@ function renderDecisionCardsToTelegram(cards: any[], server_enforce: any, global
                 signalMsg += `• <b>${escapeHtml(w.symbol)}</b> (${w.bias_4h}): ${escapeHtml(w.notes)}\n`;
             }
         }
-        
-        if (archiveUrl) {
-          signalMsg += `\n🗂️ <b>Archive</b>: ${escapeHtml(archiveUrl)}\n`;
-        }
 
         // Add as a separate message payload
         payloads.push({
             text: signalMsg,
             reply_markup: undefined // No buttons for scanner results yet
         });
+    }
+
+    // Attach archive URL ONLY to the very last message payload
+    if (archiveUrl && payloads.length > 0) {
+        payloads[payloads.length - 1].text += `\n\n🗂️ <b>Archive</b>: ${escapeHtml(archiveUrl)}`;
     }
 
     return payloads;

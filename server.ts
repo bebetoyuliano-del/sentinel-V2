@@ -519,6 +519,65 @@ async function sendTelegramMessage(text: string, reply_markup?: any) {
   }
 }
 
+async function sendInteractiveMenu() {
+    const menu = {
+        inline_keyboard: [
+            [
+                { text: "📊 Status", callback_data: "menu_status" },
+                { text: "🛡️ Mode", callback_data: "menu_mode" }
+            ],
+            [
+                { text: "🎮 Demo", callback_data: "menu_demo" },
+                { text: "📈 Trading", callback_data: "menu_trading" }
+            ],
+            [
+                { text: "🔒 Hedge/Lock", callback_data: "menu_hedge" },
+                { text: "❓ Help", callback_data: "menu_help" }
+            ]
+        ]
+    };
+    await sendTelegramMessage("🤖 <b>Main Menu</b>\n\nWhat would you like to do?", menu);
+}
+
+async function sendTradingMenu() {
+    const menu = {
+        inline_keyboard: [
+            [
+                { text: "💰 Take Profit", callback_data: "menu_tp" },
+                { text: "📉 Reduce Long", callback_data: "menu_rl" }
+            ],
+            [
+                { text: "📈 Reduce Short", callback_data: "menu_rs" },
+                { text: "➕ Add Long", callback_data: "menu_al" }
+            ],
+            [
+                { text: "➖ Add Short", callback_data: "menu_as" },
+                { text: "« Back", callback_data: "menu_main" }
+            ]
+        ]
+    };
+    await sendTelegramMessage("📈 <b>Trading Actions</b>\n\nSelect an action. Note: These buttons will guide you to provide a symbol.", menu);
+}
+
+async function sendHedgeMenu() {
+    const menu = {
+        inline_keyboard: [
+            [
+                { text: "🔒 Hedge On", callback_data: "menu_ho" },
+                { text: "⚖️ Lock Neutral", callback_data: "menu_ln" }
+            ],
+            [
+                { text: "🔓 Unlock", callback_data: "menu_ul" },
+                { text: "🔄 Role", callback_data: "menu_rr" }
+            ],
+            [
+                { text: "« Back", callback_data: "menu_main" }
+            ]
+        ]
+    };
+    await sendTelegramMessage("🔒 <b>Hedge & Lock Actions</b>\n\nSelect an action.", menu);
+}
+
 // Helper to send data to Power Automate Webhook
 async function sendPowerAutomateWebhook(data: any) {
   if (!PA_WEBHOOK_URL) return;
@@ -1590,8 +1649,8 @@ export function normalizeSymbolInput(rawSymbol?: string): string {
     return `${s}/USDT`;
 }
 
-export function normalizeActionInput(rawAction: string): { action: string, extractedSymbol?: string, extractedPercentage?: number, extractedTargetPrice?: number } {
-    let s = rawAction.toUpperCase().trim();
+export function normalizeActionInput(rawAction: string): { action: string, extractedSymbol?: string, extractedPercentage?: number, extractedTargetPrice?: number, extractedQty?: number } {
+    let s = rawAction.toUpperCase().replace(/,/g, '.').replace(/\//g, ' ').trim();
     
     // 1. Extract percentage (e.g. "50%")
     let extractedPercentage: number | undefined = undefined;
@@ -1658,10 +1717,30 @@ export function normalizeActionInput(rawAction: string): { action: string, extra
     if (symbolMatch) {
         extractedSymbol = normalizeSymbolInput(symbolMatch[0]);
         s = s.replace(symbolMatch[0], ' ').trim();
+    } else {
+        // Try simple 3-4 letter symbol if not found
+        const simpleSymbolMatch = s.match(/\b([A-Z]{3,5})\b/);
+        if (simpleSymbolMatch) {
+            extractedSymbol = normalizeSymbolInput(simpleSymbolMatch[1]);
+            s = s.replace(simpleSymbolMatch[1], ' ').trim();
+        }
     }
 
-    // 5. If still no percentage, check if any remaining number looks like one
-    if (!extractedPercentage) {
+    // 5. Extract Quantity (number followed by symbol or just a number that isn't a percentage/price)
+    let extractedQty: number | undefined = undefined;
+    // Look for decimal or integer quantity
+    const qtyMatch = s.match(/(\d+\.\d+|\b\d+\b)/);
+    if (qtyMatch) {
+        const val = parseFloat(qtyMatch[1]);
+        // If it's not a common percentage, treat as absolute quantity
+        if (![10, 15, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 100].includes(val) || s.includes(qtyMatch[1] + ' ' + (extractedSymbol?.split('/')[0] || ''))) {
+            extractedQty = val;
+            s = s.replace(qtyMatch[1], ' ').trim();
+        }
+    }
+
+    // 6. If still no percentage, check if any remaining number looks like one
+    if (!extractedPercentage && !extractedQty) {
         const numMatch = s.match(/(\d+)/);
         if (numMatch) {
             const val = parseInt(numMatch[1], 10);
@@ -1671,7 +1750,7 @@ export function normalizeActionInput(rawAction: string): { action: string, extra
         }
     }
 
-    return { action, extractedSymbol, extractedPercentage, extractedTargetPrice };
+    return { action, extractedSymbol, extractedPercentage, extractedTargetPrice, extractedQty };
 }
 
 export function buildCallbackData(params: { action: string, symbol: string, percentage?: number, targetPrice?: number, stopHedgePrice?: number }): string {
@@ -2380,16 +2459,17 @@ async function startServer() {
     }
   }
 
-  async function executeTrade(rawSymbol: string, rawAction: string, rawPercentage: number, targetPrice?: number, stopHedgePrice?: number) {
+  async function executeTrade(rawSymbol: string, rawAction: string, rawPercentage: number, targetPrice?: number, stopHedgePrice?: number, rawQty?: number) {
     const modeLabel = getValidationModeLabel();
     console.log(`[EXECUTE_TRADE] Mode: ${VALIDATION_MODE} (${modeLabel})`);
     
-    console.log("[EXEC INPUT BEFORE NORMALIZE]", { symbol: rawSymbol, action: rawAction, percentage: rawPercentage, targetPrice, stopHedgePrice });
+    console.log("[EXEC INPUT BEFORE NORMALIZE]", { symbol: rawSymbol, action: rawAction, percentage: rawPercentage, targetPrice, stopHedgePrice, rawQty });
     
     const normAction = normalizeActionInput(rawAction);
     const action = normAction.action;
     const symbol = normalizeSymbolInput(rawSymbol || normAction.extractedSymbol);
     let percentage = rawPercentage || normAction.extractedPercentage || 100;
+    let absoluteQty = rawQty || normAction.extractedQty;
     
     // Use targetPrice from normalization if not explicitly provided
     if (!targetPrice && normAction.extractedTargetPrice) {
@@ -2397,7 +2477,7 @@ async function startServer() {
         console.log(`[EXECUTE_TRADE] Using targetPrice from normalized input: ${targetPrice}`);
     }
     
-    console.log("[EXEC INPUT AFTER NORMALIZE]", { symbol, action, percentage });
+    console.log("[EXEC INPUT AFTER NORMALIZE]", { symbol, action, percentage, absoluteQty });
     
     if (!action || !symbol) {
         return `❌ Unsupported action after normalization: ${rawAction} ${rawSymbol}`;
@@ -2583,27 +2663,27 @@ async function startServer() {
       } else if (action === "REDUCE_LONG" || action === "RL") {
         side = "sell";
         targetLeg = "LONG";
-        quantity = longQty * (percentage / 100);
-        msgAction = `REDUCE_LONG ${percentage}%`;
+        quantity = absoluteQty || (longQty * (percentage / 100));
+        msgAction = absoluteQty ? `REDUCE_LONG ${absoluteQty} units` : `REDUCE_LONG ${percentage}%`;
       } else if (action === "REDUCE_SHORT" || action === "RS") {
         side = "buy";
         targetLeg = "SHORT";
-        quantity = shortQty * (percentage / 100);
-        msgAction = `REDUCE_SHORT ${percentage}%`;
+        quantity = absoluteQty || (shortQty * (percentage / 100));
+        msgAction = absoluteQty ? `REDUCE_SHORT ${absoluteQty} units` : `REDUCE_SHORT ${percentage}%`;
       } else if (action === "ADD_LONG" || action === "AL") {
         const ok = await ensureMrGuardForAdd();
         if (!ok.ok) return ok.msg!;
         side = "buy";
         targetLeg = "LONG";
-        quantity = 15 / (targetPrice || currentPrice);
-        msgAction = "ADD_LONG fixed 15 USDT";
+        quantity = absoluteQty || (15 / (targetPrice || currentPrice));
+        msgAction = absoluteQty ? `ADD_LONG ${absoluteQty} units` : "ADD_LONG fixed 15 USDT";
       } else if (action === "ADD_SHORT" || action === "AS") {
         const ok = await ensureMrGuardForAdd();
         if (!ok.ok) return ok.msg!;
         side = "sell";
         targetLeg = "SHORT";
-        quantity = 15 / (targetPrice || currentPrice);
-        msgAction = "ADD_SHORT fixed 15 USDT";
+        quantity = absoluteQty || (15 / (targetPrice || currentPrice));
+        msgAction = absoluteQty ? `ADD_SHORT ${absoluteQty} units` : "ADD_SHORT fixed 15 USDT";
       } else if (action === "TAKE_PROFIT" || action === "TP") {
         if (longQty > 0 && (!shortQty || longQty >= shortQty)) {
           side = "sell";
@@ -2947,10 +3027,48 @@ function isDuplicateEvent(key: string): boolean {
     return false;
 }
 
+async function setupTelegramCommands() {
+    if (!TELEGRAM_BOT_TOKEN) return;
+    const commands = [
+        { command: "start", description: "Show interactive menu" },
+        { command: "menu", description: "Show interactive menu" },
+        { command: "help", description: "Show help and examples" },
+        { command: "status", description: "Show current status" },
+        { command: "mode", description: "Switch validation mode" },
+        { command: "demo", description: "Toggle demo trading" },
+        { command: "tp", description: "Take Profit" },
+        { command: "rl", description: "Reduce Long" },
+        { command: "rs", description: "Reduce Short" },
+        { command: "al", description: "Add Long" },
+        { command: "as", description: "Add Short" },
+        { command: "ho", description: "Hedge On" },
+        { command: "ln", description: "Lock Neutral" },
+        { command: "ul", description: "Unlock" },
+        { command: "rr", description: "Role" }
+    ];
+
+    try {
+        await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setMyCommands`, {
+            commands: commands
+        });
+        console.log("[TG] Commands menu setup successful");
+    } catch (error: any) {
+        console.error("[TG] Failed to setup commands menu:", error.message);
+    }
+}
+
+let commandsSetup = false;
+
 async function pollTelegram() {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
   if (isPollingActive) {
     return;
+  }
+
+  // Setup commands menu on first poll
+  if (!commandsSetup) {
+    await setupTelegramCommands();
+    commandsSetup = true;
   }
   
   isPollingActive = true;
@@ -2990,6 +3108,76 @@ async function pollTelegram() {
                 continue;
             }
 
+            // Handle Menu Callbacks
+            if (rawData.startsWith('menu_')) {
+                await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+                    callback_query_id: callback.id
+                }).catch(() => {});
+
+                if (rawData === 'menu_main') {
+                    await sendInteractiveMenu();
+                } else if (rawData === 'menu_status') {
+                    const status = driftMonitor.getStatus();
+                    if (!status) {
+                        await sendTelegramMessage("❌ Drift monitor not initialized yet.");
+                    } else {
+                        const msg = `🔍 <b>RF Drift Status</b>\n\n` +
+                                    `Healthy: ${status.is_healthy ? '✅' : '❌'}\n` +
+                                    `Filt Delta: ${status.filt_delta.toExponential(4)}\n` +
+                                    `Smrn Delta: ${status.smrn_delta.toExponential(4)}\n` +
+                                    `Hash Changed: ${status.hash_changed}\n` +
+                                    `Baseline: ${new Date(status.baseline_timestamp).toISOString()}\n` +
+                                    `Last Check: ${new Date(status.last_check).toISOString()}`;
+                        await sendTelegramMessage(msg);
+                    }
+                } else if (rawData === 'menu_mode') {
+                    const modeLabel = (VALIDATION_MODE === "TEST_ORDER") ? "🧪 TEST ORDER (Validation Only)" : 
+                                      (VALIDATION_MODE === "DEMO_TRADING") ? "🎮 DEMO TRADING (Sandbox)" : 
+                                      (VALIDATION_MODE === "LIVE_TRADING") ? "🔥 LIVE TRADING (Real Money)" :
+                                      "🤖 DRY RUN (Simulation)";
+                    await sendTelegramMessage(`🛡️ <b>Current Validation Mode:</b>\n\n${modeLabel}`);
+                } else if (rawData === 'menu_demo') {
+                    const hasKeys = !!(BINANCE_DEMO_API_KEY && BINANCE_DEMO_API_SECRET);
+                    let msg = `🎮 <b>Binance Demo Trading Status</b>\n\n`;
+                    msg += `Mode: ${VALIDATION_MODE}\n`;
+                    msg += `Demo Enabled: ${VALIDATION_MODE === 'DEMO_TRADING' ? '✅ Yes' : '❌ No'}\n`;
+                    msg += `API Keys: ${hasKeys ? '✅ Set' : '❌ Missing'}\n`;
+                    if (hasKeys) {
+                        try {
+                            const balance = await binanceDemo.fetchBalance();
+                            const usdtBalance = (balance.total as any)?.USDT || 0;
+                            msg += `USDT Balance: ${usdtBalance} USDT`;
+                        } catch (err: any) {
+                            msg += `Connection: ❌ Failed\nError: ${escapeHtml(err.message)}`;
+                        }
+                    }
+                    await sendTelegramMessage(msg);
+                } else if (rawData === 'menu_trading') {
+                    await sendTradingMenu();
+                } else if (rawData === 'menu_hedge') {
+                    await sendHedgeMenu();
+                } else if (rawData === 'menu_help') {
+                    const msg = `🤖 <b>Trading Bot Commands</b>\n\n` +
+                                `<b>Trade Actions:</b>\n` +
+                                `/tp [symbol] [percentage] - Take Profit\n` +
+                                `/rl [symbol] [percentage/qty] - Reduce Long\n` +
+                                `/rs [symbol] [percentage/qty] - Reduce Short\n` +
+                                `/al [symbol] [qty] - Add Long\n` +
+                                `/as [symbol] [qty] - Add Short\n` +
+                                `/ho [symbol] - Hedge On\n` +
+                                `/ln [symbol] - Lock Neutral\n` +
+                                `/ul [symbol] - Unlock\n` +
+                                `/rr [symbol] - Role\n\n` +
+                                `<b>Admin:</b>\n` +
+                                `/status, /mode, /demo, /menu`;
+                    await sendTelegramMessage(msg);
+                } else if (['menu_tp', 'menu_rl', 'menu_rs', 'menu_al', 'menu_as', 'menu_ho', 'menu_ln', 'menu_ul', 'menu_rr'].includes(rawData)) {
+                    const action = rawData.replace('menu_', '').toUpperCase();
+                    await sendTelegramMessage(`👉 <b>Action Selected: ${action}</b>\n\nPlease type the symbol to execute, e.g.:\n<code>${action} BTC</code>`);
+                }
+                continue;
+            }
+
             const parsed = parseTelegramCallbackData(rawData);
             console.log(`\n--- TG EVENT ---`);
             console.log(`[TG UPDATE ID] ${update.update_id}`);
@@ -3014,7 +3202,14 @@ async function pollTelegram() {
             });
 
             // Execute Trade with Target Price and Stop Hedge
-            const resultMsg = await executeTrade(parsed.symbol, parsed.action, parsed.percentage || 100, parsed.targetPrice, parsed.stopHedgePrice);
+            const resultMsg = await executeTrade(
+                parsed.symbol, 
+                parsed.action, 
+                parsed.percentage || 100, 
+                parsed.targetPrice, 
+                parsed.stopHedgePrice,
+                undefined // rawQty not in callback data yet
+            );
             
             // Send Result
             await sendTelegramMessage(resultMsg);
@@ -3032,8 +3227,37 @@ async function pollTelegram() {
                 continue;
             }
 
-            // Handle Admin Commands
-            if (userText === '/rf_drift_status') {
+            if (userText === '/help' || userText === '/commands') {
+                const msg = `🤖 <b>Trading Bot Commands</b>\n\n` +
+                            `<b>Trade Actions:</b>\n` +
+                            `/tp [symbol] [percentage] - Take Profit\n` +
+                            `/rl [symbol] [percentage/qty] - Reduce Long\n` +
+                            `/rs [symbol] [percentage/qty] - Reduce Short\n` +
+                            `/al [symbol] [qty] - Add Long\n` +
+                            `/as [symbol] [qty] - Add Short\n` +
+                            `/ho [symbol] - Hedge On\n` +
+                            `/ln [symbol] - Lock Neutral\n` +
+                            `/ul [symbol] - Unlock\n` +
+                            `/rr [symbol] - Role\n\n` +
+                            `<b>Examples:</b>\n` +
+                            `<code>/rl BTC 50%</code>\n` +
+                            `<code>/rl BTC 0.1</code>\n` +
+                            `<code>Up to 0.0414: REDUCE_LONG BTC 0.1</code>\n\n` +
+                            `<b>Admin:</b>\n` +
+                            `/status - Show current status\n` +
+                            `/mode - Switch validation mode\n` +
+                            `/demo - Toggle demo trading\n` +
+                            `/menu - Show interactive menu`;
+                await sendTelegramMessage(msg);
+                continue;
+            }
+
+            if (userText === '/start' || userText === '/menu') {
+                await sendInteractiveMenu();
+                continue;
+            }
+
+            if (userText === '/status') {
                 const status = driftMonitor.getStatus();
                 if (!status) {
                     await sendTelegramMessage("❌ Drift monitor not initialized yet. Waiting for first BTC/USDT 4H data fetch.");
@@ -3050,7 +3274,7 @@ async function pollTelegram() {
                 continue;
             }
 
-            if (userText === '/validation_mode') {
+            if (userText === '/mode') {
                 const modeLabel = (VALIDATION_MODE === "TEST_ORDER") ? "🧪 TEST ORDER (Validation Only)" : 
                                   (VALIDATION_MODE === "DEMO_TRADING") ? "🎮 DEMO TRADING (Sandbox)" : 
                                   (VALIDATION_MODE === "LIVE_TRADING") ? "🔥 LIVE TRADING (Real Money)" :
@@ -3059,7 +3283,7 @@ async function pollTelegram() {
                 continue;
             }
 
-            if (userText === '/demo_status') {
+            if (userText === '/demo') {
                 const hasKeys = !!(BINANCE_DEMO_API_KEY && BINANCE_DEMO_API_SECRET);
                 let msg = `🎮 <b>Binance Demo Trading Status</b>\n\n`;
                 msg += `Mode: ${VALIDATION_MODE}\n`;
@@ -3108,7 +3332,9 @@ async function pollTelegram() {
                     parsedText.extractedSymbol, 
                     parsedText.action, 
                     parsedText.extractedPercentage || 100,
-                    parsedText.extractedTargetPrice
+                    parsedText.extractedTargetPrice,
+                    undefined, // stopHedgePrice
+                    parsedText.extractedQty
                 );
                 await sendTelegramMessage(resultMsg);
                 continue;

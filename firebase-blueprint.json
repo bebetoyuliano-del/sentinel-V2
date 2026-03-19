@@ -35,6 +35,26 @@
       },
       "required": ["role", "content", "timestamp"]
     },
+    "TelegramChat": {
+      "title": "TelegramChat",
+      "description": "Chat history for a specific Telegram user",
+      "type": "object",
+      "properties": {
+        "history": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "role": { "type": "string", "enum": ["user", "model"] },
+              "content": { "type": "string" }
+            },
+            "required": ["role", "content"]
+          }
+        },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["history"]
+    },
     "JournalEntry": {
       "title": "JournalEntry",
       "description": "Trading journal entry",
@@ -49,6 +69,24 @@
         "timestamp": { "type": "string", "format": "date-time" }
       },
       "required": ["symbol", "side", "pnl", "timestamp"]
+    },
+    "JournalSummary": {
+      "title": "JournalSummary",
+      "description": "Auto-generated 12-hour trading journal summary",
+      "type": "object",
+      "properties": {
+        "timestamp": { "type": "string", "format": "date-time" },
+        "period": { "type": "string" },
+        "totalTrades": { "type": "number" },
+        "winRate": { "type": "number" },
+        "netPnl": { "type": "number" },
+        "tradedSymbols": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "evaluation": { "type": "string" }
+      },
+      "required": ["timestamp", "period", "totalTrades", "winRate", "netPnl", "evaluation"]
     }
   },
   "firestore": {
@@ -64,9 +102,17 @@
       "schema": { "$ref": "#/entities/ChatMessage" },
       "description": "Stores chat history"
     },
-    "/journal/{journalId}": {
+    "/telegram_chats/{chatId}": {
+      "schema": { "$ref": "#/entities/TelegramChat" },
+      "description": "Stores Telegram chat history for Sentinel"
+    },
+    "/trading_journal/{journalId}": {
       "schema": { "$ref": "#/entities/JournalEntry" },
       "description": "Stores trading journal entries"
+    },
+    "/journal_summaries/{summaryId}": {
+      "schema": { "$ref": "#/entities/JournalSummary" },
+      "description": "Stores 12-hour auto-generated journal summaries"
     }
   }
 }

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Activity, Play, Square, TrendingUp, AlertCircle, RefreshCw, MessageSquare, Target, BarChart2, X, Bot, User, Send, LogOut, CheckCircle2 } from 'lucide-react';
+import { Activity, Play, Square, TrendingUp, AlertCircle, RefreshCw, MessageSquare, Target, BarChart2, X, Bot, User, Send, LogOut, CheckCircle2, BookOpen } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { AdvancedRealTimeChart } from 'react-ts-tradingview-widgets';
 import { auth, db, loginWithGoogle, logout } from './firebase';
@@ -46,17 +46,32 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [showChart, setShowChart] = useState(false);
   const [chartSymbol, setChartSymbol] = useState('BINANCE:BTCUSDT.P');
-  const [activeTab, setActiveTab] = useState<'signals' | 'chat'>('signals');
+  const [activeTab, setActiveTab] = useState<'signals' | 'chat' | 'journal'>('signals');
   const [chatMessages, setChatMessages] = useState<{role: 'user'|'ai', content: string}[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [isChatting, setIsChatting] = useState(false);
   const [isForceRunning, setIsForceRunning] = useState(false);
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
+  const [journal, setJournal] = useState<any[]>([]);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       setUser(currentUser);
+      if (currentUser) {
+        // Ensure user document exists in Firestore
+        const { doc, setDoc, getDoc } = await import('firebase/firestore');
+        const userDocRef = doc(db, 'users', currentUser.uid);
+        const userDoc = await getDoc(userDocRef);
+        if (!userDoc.exists()) {
+          await setDoc(userDocRef, {
+            name: currentUser.displayName || '',
+            email: currentUser.email || '',
+            role: currentUser.email === 'bebetoyuliano@gmail.com' ? 'admin' : 'user',
+            createdAt: new Date().toISOString()
+          });
+        }
+      }
       setAuthLoading(false);
     });
     return () => unsubscribe();
@@ -89,9 +104,22 @@ export default function App() {
       console.error("Error fetching chats from Firestore:", err);
     });
 
+    // Listen to journal
+    const qJournal = query(collection(db, 'trading_journal'), orderBy('timestamp', 'desc'), limit(100));
+    const unsubJournal = onSnapshot(qJournal, (snapshot) => {
+      const fetchedJournal = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setJournal(fetchedJournal);
+    }, (err) => {
+      console.error("Error fetching journal from Firestore:", err);
+    });
+
     return () => {
       unsubSignals();
       unsubChats();
+      unsubJournal();
     };
   }, [user]);
 
@@ -545,6 +573,13 @@ export default function App() {
                 <Bot className="w-4 h-4" />
                 Chat with AI
               </button>
+              <button 
+                onClick={() => setActiveTab('journal')}
+                className={`text-sm font-medium flex items-center gap-2 px-2 py-1 border-b-2 transition-colors ${activeTab === 'journal' ? 'border-emerald-500 text-emerald-400' : 'border-transparent text-zinc-400 hover:text-zinc-300'}`}
+              >
+                <BookOpen className="w-4 h-4" />
+                Trading Journal
+              </button>
             </div>
 
             <div className="flex-1 overflow-y-auto min-h-0">
@@ -564,6 +599,98 @@ export default function App() {
                         </div>
                         <div className="prose prose-invert prose-sm max-w-none prose-p:leading-relaxed prose-pre:bg-zinc-950 prose-pre:border prose-pre:border-zinc-800">
                           <ReactMarkdown>{signal.content}</ReactMarkdown>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              ) : activeTab === 'journal' ? (
+                <div className="space-y-4">
+                  {journal.length > 0 && (
+                    <div className="grid grid-cols-3 gap-4 mb-4">
+                      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
+                        <div className="text-xs text-zinc-500 mb-1">Total Trades</div>
+                        <div className="text-2xl font-bold">{journal.length}</div>
+                      </div>
+                      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
+                        <div className="text-xs text-zinc-500 mb-1">Win Rate</div>
+                        <div className="text-2xl font-bold text-emerald-400">
+                          {((journal.filter(j => (j.pnl || 0) > 0).length / journal.length) * 100).toFixed(1)}%
+                        </div>
+                      </div>
+                      <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
+                        <div className="text-xs text-zinc-500 mb-1">Avg PnL</div>
+                        <div className={`text-2xl font-bold ${journal.reduce((acc, j) => acc + (j.pnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                          {(journal.reduce((acc, j) => acc + (j.pnl || 0), 0) / journal.length).toFixed(2)}%
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  {journal.length === 0 ? (
+                    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-12 text-center text-zinc-500">
+                      <BookOpen className="w-8 h-8 mx-auto mb-3 opacity-20" />
+                      <p className="text-sm">No journal entries yet.</p>
+                      <p className="text-xs mt-1">Trades executed by Sentinel will appear here.</p>
+                    </div>
+                  ) : (
+                    journal.map(entry => (
+                      <div key={entry.id} className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+                        <div className="flex justify-between items-start mb-4">
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className={`px-2 py-0.5 rounded text-xs font-medium ${entry.side === 'BUY' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>
+                                {entry.side}
+                              </span>
+                              <span className="font-bold text-lg">{entry.symbol}</span>
+                            </div>
+                            <div className="text-xs text-zinc-500 mt-1 font-mono">
+                              {new Date(entry.timestamp).toLocaleString()}
+                            </div>
+                          </div>
+                          <div className={`text-right ${entry.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                            <div className="font-mono font-bold">
+                              {entry.pnl >= 0 ? '+' : ''}{entry.pnl?.toFixed(2) || '0.00'}%
+                            </div>
+                            <div className="text-xs opacity-70">Est. PnL</div>
+                          </div>
+                        </div>
+                        
+                        <div className="grid grid-cols-3 gap-4 mb-4 bg-zinc-950 rounded-lg p-3 border border-zinc-800/50">
+                          <div>
+                            <div className="text-xs text-zinc-500">Entry</div>
+                            <div className="font-mono text-sm">${entry.entryPrice}</div>
+                          </div>
+                          <div>
+                            <div className="text-xs text-zinc-500">Stop Loss</div>
+                            <div className="font-mono text-sm text-rose-400">${entry.stopLoss}</div>
+                          </div>
+                          <div>
+                            <div className="text-xs text-zinc-500">Targets</div>
+                            <div className="font-mono text-sm text-emerald-400">{entry.targets?.join(', ')}</div>
+                          </div>
+                        </div>
+
+                        <div className="space-y-3">
+                          <div>
+                            <div className="text-xs text-zinc-500 mb-1">AI Reasoning</div>
+                            <p className="text-sm text-zinc-300 leading-relaxed">{entry.reason}</p>
+                          </div>
+                          
+                          {entry.sentiment && (
+                            <div className="bg-zinc-950/50 rounded-lg p-3 border border-zinc-800/50">
+                              <div className="flex items-center gap-2 mb-1">
+                                <div className="text-xs text-zinc-500">Sentiment Analysis</div>
+                                <span className={`text-xs font-medium px-1.5 py-0.5 rounded ${
+                                  entry.sentiment.status === 'BULLISH' ? 'bg-emerald-500/20 text-emerald-400' :
+                                  entry.sentiment.status === 'BEARISH' ? 'bg-rose-500/20 text-rose-400' :
+                                  'bg-zinc-500/20 text-zinc-400'
+                                }`}>
+                                  {entry.sentiment.status} ({entry.sentiment.score}/100)
+                                </span>
+                              </div>
+                              <p className="text-sm text-zinc-400 italic">"{entry.sentiment.reason}"</p>
+                            </div>
+                          )}
                         </div>
                       </div>
                     ))

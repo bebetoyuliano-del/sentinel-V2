@@ -7,12 +7,13 @@ import ccxt from 'ccxt';
 import cors from 'cors';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
-import { RSI, MACD, EMA } from 'technicalindicators';
+import { RSI, MACD, EMA, BollingerBands, SMA } from 'technicalindicators';
 import { Storage } from '@google-cloud/storage';
 import { initializeApp, applicationDefault } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 import fs from 'fs';
 import path from 'path';
+import cron from 'node-cron';
 
 // Initialize Firebase Admin
 let db: any = null;
@@ -221,6 +222,7 @@ function calculateSMC(ohlcv: any[]) {
     swingHighs: [] as number[],
     swingLows: [] as number[]
   };
+  const liquiditySweeps = { bullish: [] as any[], bearish: [] as any[] };
   
   // 1. Calculate Fair Value Gaps (FVG)
   for (let i = 2; i < ohlcv.length; i++) {
@@ -298,11 +300,89 @@ function calculateSMC(ohlcv: any[]) {
   }
   structure.trend = currentTrend;
   
+  // 5. Liquidity Sweeps
+  if (swings.length > 2) {
+    // Check recent bars for sweeps
+    for (let i = ohlcv.length - 5; i < ohlcv.length; i++) {
+        const bar = ohlcv[i];
+        const low = bar[3];
+        const high = bar[2];
+        const close = bar[4];
+        
+        for (const swing of swings) {
+            if (swing.index >= i) continue;
+            if (swing.type === 'LOW' && low < swing.price && close > swing.price) {
+                liquiditySweeps.bullish.push({ price: swing.price, index: i });
+            }
+            if (swing.type === 'HIGH' && high > swing.price && close < swing.price) {
+                liquiditySweeps.bearish.push({ price: swing.price, index: i });
+            }
+        }
+    }
+  }
+
   // Keep only last 3 swing points for brevity
   structure.swingHighs = structure.swingHighs.slice(-3);
   structure.swingLows = structure.swingLows.slice(-3);
+  liquiditySweeps.bullish = liquiditySweeps.bullish.slice(-2);
+  liquiditySweeps.bearish = liquiditySweeps.bearish.slice(-2);
 
-  return { fvgs, orderBlocks, structure };
+  return { fvgs, orderBlocks, structure, liquiditySweeps };
+}
+
+function calculateVSA(ohlcv: any[]) {
+    if (ohlcv.length < 20) return null;
+    const lastBar = ohlcv[ohlcv.length - 1];
+    const volume = lastBar[5];
+    const avgVolume = ohlcv.slice(-20).reduce((acc, bar) => acc + bar[5], 0) / 20;
+    const spread = lastBar[2] - lastBar[3];
+    const avgSpread = ohlcv.slice(-20).reduce((acc, bar) => acc + (bar[2] - bar[3]), 0) / 20;
+    const closePos = (lastBar[4] - lastBar[3]) / (lastBar[2] - lastBar[3] || 1);
+    
+    let signal = "NEUTRAL";
+    if (volume > avgVolume * 1.5) {
+        if (spread < avgSpread * 0.5) {
+            signal = closePos > 0.5 ? "BULLISH_ABSORPTION" : "BEARISH_ABSORPTION";
+        } else if (spread > avgSpread * 1.5) {
+            signal = closePos > 0.7 ? "BULLISH_EFFORT" : (closePos < 0.3 ? "BEARISH_EFFORT" : "NEUTRAL");
+        }
+    }
+    return { volumeRatio: volume / avgVolume, spreadRatio: spread / avgSpread, signal };
+}
+
+function calculateFibonacci(ohlcv: any[]) {
+    if (ohlcv.length < 50) return null;
+    const highs = ohlcv.slice(-50).map(b => b[2]);
+    const lows = ohlcv.slice(-50).map(b => b[3]);
+    const maxHigh = Math.max(...highs);
+    const minLow = Math.min(...lows);
+    const diff = maxHigh - minLow;
+    return {
+        high: maxHigh,
+        low: minLow,
+        levels: {
+            "0.236": maxHigh - 0.236 * diff,
+            "0.382": maxHigh - 0.382 * diff,
+            "0.5": maxHigh - 0.5 * diff,
+            "0.618": maxHigh - 0.618 * diff,
+            "0.786": maxHigh - 0.786 * diff
+        }
+    };
+}
+
+function calculateRSIDivergence(ohlcv: any[], rsiValues: number[]) {
+    if (ohlcv.length < 30 || rsiValues.length < 30) return "NONE";
+    
+    // Simple divergence check: compare last 2 peaks/troughs
+    const lastPrice = ohlcv[ohlcv.length - 1][4];
+    const prevPrice = ohlcv[ohlcv.length - 10][4];
+    const lastRsi = rsiValues[rsiValues.length - 1];
+    const prevRsi = rsiValues[rsiValues.length - 10];
+    
+    if (lastPrice > prevPrice && lastRsi < prevRsi) return "BEARISH";
+    if (lastPrice < prevPrice && lastRsi > prevRsi) return "BULLISH";
+    
+    return "NONE";
 }
 
 const app = express();
@@ -580,6 +660,10 @@ async function sendHedgeMenu() {
 
 // Helper to send data to Power Automate Webhook
 async function sendPowerAutomateWebhook(data: any) {
+  // PENDING: Sistem pengiriman ke Power Automate (yang mungkin meneruskan email ke Outlook) sedang ditunda
+  console.log('⏳ [Webhook] PENDING: Pengiriman data ke Power Automate Webhook sedang ditunda sementara.');
+  return;
+
   if (!PA_WEBHOOK_URL) return;
   try {
     await axios.post(PA_WEBHOOK_URL, data);
@@ -689,6 +773,10 @@ async function fetchMarketDataWithIndicators(symbols: string[]) {
         const rqk4H = calculateRQK(validOhlcv4h);
         const wae4H = calculateWAE(validOhlcv4h);
         const ema50_4H = EMA.calculate({ values: closes4h, period: 50 });
+        const sma200_4H = SMA.calculate({ values: closes4h, period: 200 });
+        const bb4H = BollingerBands.calculate({ period: 20, values: closes4h, stdDev: 2 });
+        const vsa4H = calculateVSA(validOhlcv4h);
+        const fibo4H = calculateFibonacci(validOhlcv4h);
         
         // VWAP Calculation (Heuristic for 4H/1H)
         const calculateVWAP = (data: any[]) => {
@@ -712,10 +800,13 @@ async function fetchMarketDataWithIndicators(symbols: string[]) {
         
         const closes1h = validOhlcv1h.map(c => c[4] as number);
         const rsi1H = RSI.calculate({ values: closes1h, period: 14 });
+        const rsiDiv1H = calculateRSIDivergence(validOhlcv1h, rsi1H);
         const macd1H = MACD.calculate({ values: closes1h, fastPeriod: 12, slowPeriod: 26, signalPeriod: 9, SimpleMAOscillator: false, SimpleMASignal: false });
         const smc1H = calculateSMC(validOhlcv1h);
         const vwap1h = calculateVWAP(validOhlcv1h);
         const vwap1h_dist = vwap1h ? ((ticker.last - vwap1h) / vwap1h) * 100 : null;
+        const vsa1H = calculateVSA(validOhlcv1h);
+        const bb1H = BollingerBands.calculate({ period: 20, values: closes1h, stdDev: 2 });
         
         // 15m Calculations (Short Entry/Exit & SMC)
         const tf15mMs = mapTfToMs('15m');
@@ -724,7 +815,9 @@ async function fetchMarketDataWithIndicators(symbols: string[]) {
         
         const closes15m = validOhlcv15m.map(c => c[4] as number);
         const rsi15m = RSI.calculate({ values: closes15m, period: 14 });
+        const rsiDiv15m = calculateRSIDivergence(validOhlcv15m, rsi15m);
         const smc15m = calculateSMC(validOhlcv15m);
+        const vsa15m = calculateVSA(validOhlcv15m);
         
         marketData[pair] = {
           currentPrice: ticker.last,
@@ -739,6 +832,10 @@ async function fetchMarketDataWithIndicators(symbols: string[]) {
             RQK_Channel: rqk4H ? { estimate: rqk4H.estimate } : null,
             WAE: wae4H,
             EMA_50: ema50_4H.length > 0 ? ema50_4H[ema50_4H.length - 1] : null,
+            SMA_200: sma200_4H.length > 0 ? sma200_4H[sma200_4H.length - 1] : null,
+            BollingerBands: bb4H.length > 0 ? bb4H[bb4H.length - 1] : null,
+            VSA: vsa4H,
+            Fibonacci: fibo4H,
             VWAP: vwap4h,
             VWAP_dist_pct: vwap4h_dist,
             ATR14: atr14_4h ?? null
@@ -747,13 +844,18 @@ async function fetchMarketDataWithIndicators(symbols: string[]) {
             VWAP: vwap1h,
             VWAP_dist_pct: vwap1h_dist,
             RSI_14: rsi1H.length > 0 ? rsi1H[rsi1H.length - 1] : null,
+            RSI_Divergence: rsiDiv1H,
             MACD: macd1H.length > 0 ? macd1H[macd1H.length - 1] : null,
             SMC: smc1H,
+            VSA: vsa1H,
+            BollingerBands: bb1H.length > 0 ? bb1H[bb1H.length - 1] : null,
             ATR14: atr14_1h ?? null
           },
           TF_15m: {
             RSI_14: rsi15m.length > 0 ? rsi15m[rsi15m.length - 1] : null,
-            SMC: smc15m
+            RSI_Divergence: rsiDiv15m,
+            SMC: smc15m,
+            VSA: vsa15m
           }
         };
       } catch (e) {
@@ -816,7 +918,7 @@ function calculateHedgingRecovery(positions: any[]) {
 }
 
 // Helper to call Gemini API with retry logic
-async function generateWithRetry(prompt: string, modelName: string = 'gemini-3.1-pro-preview', maxRetries: number = 3, jsonMode: boolean = false) {
+async function generateWithRetry(prompt: string, modelName: string = 'gemini-3.1-pro-preview', maxRetries: number = 3, jsonMode: boolean = false, base64Image: string | null = null, enableSearch: boolean = false) {
   const ai = getAI();
   let attempt = 0;
   
@@ -825,11 +927,25 @@ async function generateWithRetry(prompt: string, modelName: string = 'gemini-3.1
     try {
       const config: any = {
         model: modelName,
-        contents: prompt,
       };
       
+      if (base64Image) {
+        config.contents = {
+          parts: [
+            { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
+            { text: prompt }
+          ]
+        };
+      } else {
+        config.contents = prompt;
+      }
+      
+      config.config = {};
       if (jsonMode) {
-        config.config = { responseMimeType: 'application/json' };
+        config.config.responseMimeType = 'application/json';
+      }
+      if (enableSearch) {
+        config.config.tools = [{ googleSearch: {} }];
       }
 
       const response = await ai.models.generateContent(config);
@@ -854,11 +970,25 @@ async function generateWithRetry(prompt: string, modelName: string = 'gemini-3.1
     try {
       const config: any = {
         model: 'gemini-3-flash-preview',
-        contents: prompt,
       };
       
+      if (base64Image) {
+        config.contents = {
+          parts: [
+            { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
+            { text: prompt }
+          ]
+        };
+      } else {
+        config.contents = prompt;
+      }
+      
+      config.config = {};
       if (jsonMode) {
-        config.config = { responseMimeType: 'application/json' };
+        config.config.responseMimeType = 'application/json';
+      }
+      if (enableSearch) {
+        config.config.tools = [{ googleSearch: {} }];
       }
 
       const response = await ai.models.generateContent(config);
@@ -866,22 +996,36 @@ async function generateWithRetry(prompt: string, modelName: string = 'gemini-3.1
     } catch (error: any) {
       console.error('Fallback model (gemini-3-flash-preview) also failed:', error.message || error);
       
-      // Try one more fallback: gemini-2.0-flash-exp
-      console.log('Falling back to gemini-2.0-flash-exp...');
+      // Try one more fallback: gemini-3.1-flash-preview
+      console.log('Falling back to gemini-3.1-flash-preview...');
       try {
         const config: any = {
-          model: 'gemini-2.0-flash-exp',
-          contents: prompt,
+          model: 'gemini-3.1-flash-preview',
         };
         
+        if (base64Image) {
+          config.contents = {
+            parts: [
+              { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
+              { text: prompt }
+            ]
+          };
+        } else {
+          config.contents = prompt;
+        }
+        
+        config.config = {};
         if (jsonMode) {
-          config.config = { responseMimeType: 'application/json' };
+          config.config.responseMimeType = 'application/json';
+        }
+        if (enableSearch) {
+          config.config.tools = [{ googleSearch: {} }];
         }
 
         const response = await ai.models.generateContent(config);
         return response.text;
       } catch (error2: any) {
-        console.error('Second fallback model (gemini-2.0-flash-exp) also failed:', error2.message || error2);
+        console.error('Second fallback model (gemini-3.1-flash-preview) also failed:', error2.message || error2);
       }
     }
   }
@@ -1211,6 +1355,37 @@ async function monitorMarkets() {
       (1) DECISION CARD 1-LAYAR per pair (siap lihat → klik),
       (2) SOP skenario (rejection / break&retest up/down / invalidation),
       (3) Paket ENFORCEMENT untuk server (validasi stop‑lock, MR projected per aksi, dan alerts deterministik).
+      (4) Gunakan Paket “Institutional Reversal Detector” untuk mendeteksi reversal/pullback sedini mungkin:
+      STRUKTUR ANALISIS YANG WAJIB KAMU GUNAKAN
+      Untuk setiap simbol pair dan timeframe:
+      1) **Market Structure**
+        - Identifikasi HH/HL atau LH/LL.
+        - Tentukan apakah ada perubahan struktur pertama (CHoCH / MS Break).
+        - Jika struktur berubah → tanda reversal awal.
+      2) **Smart Money (OB + Liquidity)**
+        - Deteksi Order Block mana yang sedang aktif (bullish atau bearish).
+        - Beri peringatan jika harga menyapu likuiditas (equal high/low sweep).
+        - Tentukan zona potensial untuk pullback atau breakout kuat.
+      3) **VSA**
+        - Cari:
+        - Climactic volume
+        - Stopping volume
+        - No Supply / No Demand
+        - Beri sinyal apakah trend mulai melemah.
+      4) **Divergence (RSI/MACD)**
+        - Identifikasi bullish/bearish divergence.
+        - Tandai apakah ini divergence kuat atau lemah.
+      5) **Fibonacci Pullback**
+        - Gunakan swing terakhir.
+        - Fokuskan analisis pada 0.618 – 0.705 – 0.786.
+        - Beri konfirmasi jika level Fibo bertemu OB / Liquidity.
+      6) **Bollinger Band**
+        - Tandai jika candle close di luar band → potensi overextension.
+        - Konfirmasi re-entry ke band → sinyal reversal valid.
+      7) **MA50 & MA200**
+        - MA200 = area reversal besar.
+        - MA50 flattening = momentum melemah.
+        - Cross behaviour = konfirmasi tambahan.n.
 
       TUGAS 2: TOP 20 SCANNER (SINYAL TAMBAHAN)
       HANYA JIKA accountRisk.marginRatio < 25%, pilih 1–2 koin dari 'scannerUniverse' dengan setup PALING SEMPURNA.
@@ -1227,7 +1402,7 @@ async function monitorMarkets() {
          - DILARANG membuat decision_card untuk koin di 'scannerUniverse' yang TIDAK memiliki posisi di 'accountPositions'.
          - Fokus analisa adalah mengelola risiko dan profitabilitas posisi yang sedang berjalan.
       1) GUARD MODE (MR% > mr_guard_pct):
-         - Dilarang: ADD_LONG (AL), ADD_SHORT (AS), HEDGE_ON (HO), ROLE (RR).
+         - Dilarang: ADD_LONG (AL), ADD_SHORT (AS), HEDGE_ON (HO), ROLE (RR). bila MR < 25%
          - Diperbolehkan: HOLD, REDUCE_LONG (RL), REDUCE_SHORT (RS), LOCK_NEUTRAL (LN),
            UNLOCK (UL) *hanya jika mengurangi exposure & hedge sudah Hijau/BE*, TAKE_PROFIT (TP).
          - Prioritas saat GUARD:
@@ -1277,6 +1452,7 @@ async function monitorMarkets() {
          - Strategi Recovery ini menggunakan konsep "Recovery by Zone (Supply–Demand–Pivot–StopHedge)" sebagai SOP utama.
          - Menyesuaikan strategi: SupplyHigh/Low → zona jual ideal, DemandHigh/Low → zona beli ideal, Pivot → equilibrium untuk reduce, StopHedge → invalidasi lock.
          - Pola Zone Strategy: Lock at Extremes, Release at Pivot, Reduce di Mid-Range, Add di Edge, Hold Lock jika harga di tengah, Recovery mode jika harga kembali ke Demand/Supply.
+         - Gunakan Paket “Institutional Reversal Detector” untuk mendeteksi reversal/pullback sedini mungkin
          - Terapkan juga keahlian inti berikut jika posisi dalam status RECOVERY:
          - A. LOCKING STANDARD: Gunakan Full/Partial Lock untuk menetralisir risiko. Evaluasi apakah lock menurunkan MR atau mencegah kerusakan lebih dalam. Hindari over-hedging.
          - B. HEDGING STEP: Gunakan Step-by-Step Recovery. Susun urutan step yang aman (misal: Reduce dulu → Add kecil → Lock → Unlock di zone tertentu). Perhatikan efek pada MR Projected.
@@ -1297,6 +1473,7 @@ async function monitorMarkets() {
          - Jika MR < 25 → boleh keluarkan sinyal baru (maksimal 2).
 
       2) DETEKSI “AWAL TREND / FLIP” (RF 4H):
+         - Gunakan Paket “Institutional Reversal Detector” untuk mendeteksi “AWAL TREND / FLIP”
          - rf_flip_ok: RangeFilter TF_4H ≠ RangeFilter TF_1D, ATAU RangeFilter TF_4H baru saja berganti.
          - wae_ok: WAE TF_4H trend selaras arah sinyal & isExploding = true.
          - rqk_ok (bonus): harga di sisi yang benar dari RQK estimate.
@@ -1353,7 +1530,13 @@ async function monitorMarkets() {
               "trend_4h": "UP"|"DOWN"|"NETRAL",
               "wae_4h": { "trend":"UP"|"DOWN"|"NEUTRAL", "isExploding": boolean, "isDeadZone": boolean },
               "smc_1h": { "structure":"BOS_BULL"|"BOS_BEAR"|"CHOCH_BULL"|"CHOCH_BEAR"|"RANGE"|"UNKNOWN",
-                          "swing_high": number|null, "swing_low": number|null },
+                          "swing_high": number|null, "swing_low": number|null,
+                          "liquidity_sweeps": { "bullish": boolean, "bearish": boolean } },
+              "vsa": { "signal": "BULLISH_ABSORPTION"|"BEARISH_ABSORPTION"|"BULLISH_EFFORT"|"BEARISH_EFFORT"|"NEUTRAL", "volume_ratio": number },
+              "rsi_divergence": "BULLISH"|"BEARISH"|"NONE",
+              "fibonacci": { "in_golden_zone": boolean, "nearest_level": number },
+              "ma_confirmation": { "above_ma50": boolean, "above_ma200": boolean },
+              "bollinger": { "status": "OVERBOUGHT"|"OVERSOLD"|"NORMAL", "bandwidth": number },
               "atr14_4h": number|null
             },
             "levels": {
@@ -1428,6 +1611,7 @@ async function monitorMarkets() {
                "targets": { "t1": number, "t2": number },
                "rr": { "t1_rr": number, "t2_rr": number },
                "confluence": { "rf_flip_ok": boolean, "wae_exploding": boolean, "rqk_ok": boolean, "smc_zone": "DEMAND|SUPPLY", "distance_to_zone_pct": number, "notes": "string" },
+               "sentiment": { "score_1_to_10": number, "status": "BULLISH|BEARISH|NEUTRAL", "reason": "string (berdasarkan pencarian berita terbaru)" },
                "why_this_pair": "string", "disclaimer": "string"
              }
            ],
@@ -1510,7 +1694,8 @@ async function monitorMarkets() {
       1) H1 bullish & tidak ada h1_choch_bear
       2) acceptance_above_supply == true (reclaim/PDH acceptance)
       3) Price menahan di atas equilibrium setelah retest
-      4) MR < soft cap BASE (mis. < 18%)
+      4) MR < soft cap BASE (mis. < 28%)
+      5) Bollinger Band
       → ACTION: primary: "RE-ENGAGE_LONG", status: "CONDITIONAL", do: tambah long kecil (10–20% dari base), **tetap pertahankan short** (tidak remove)
 
       SCENARIO B — RANGE (ALLOWED HOLD):
@@ -1533,6 +1718,7 @@ async function monitorMarkets() {
       - Sinyal yang difilter untuk dianalisa (new_signals) HARUS berasal dari 20 pair dengan volume harian (daily volume) terbesar di Binance Futures ('scannerUniverse').
       - Ambil HANYA SATU atau beberapa sinyal TERBAIK dari 20 pair tersebut.
       - Sinyal HANYA BOLEH diberikan/dihasilkan JIKA Margin Ratio (MR) saat ini DI BAWAH 25%. Jika MR >= 25%, kosongkan array new_signals.
+      - SENTIMEN PASAR: Gunakan alat pencarian (Google Search) untuk mencari berita terbaru tentang koin yang akan direkomendasikan. Berikan skor sentimen 1-10, status (BULLISH/BEARISH/NEUTRAL), dan alasan singkat di field 'sentiment'.
 
       STRICT OUTPUT:
       - Keluarkan JSON saja sesuai kontrak; TIDAK BOLEH ada teks di luar JSON.
@@ -1541,8 +1727,8 @@ async function monitorMarkets() {
       - Untuk tombol (buttons.show), label WAJIB menyertakan nama pair agar jelas (contoh: "RL BTC", "HOLD ETH").
     `;
 
-    // Switched to gemini-3-flash-preview for better stability
-    const analysisJson = await generateWithRetry(prompt, 'gemini-3-flash-preview', 3, true);
+    // Switched to gemini-3-flash-preview for better stability, with Search enabled
+    const analysisJson = await generateWithRetry(prompt, 'gemini-3-flash-preview', 3, true, null, true);
     
     if (!analysisJson) {
       throw new Error('Failed to generate analysis');
@@ -1605,6 +1791,33 @@ async function monitorMarkets() {
         await sendDecisionCardsEmail(cards, analysisData.excel_rows);
         await sendPowerAutomateWebhook(analysisData);
     }
+
+    // --- NEW: Save to Trading Journal ---
+    if (db && new_signals && new_signals.signals && new_signals.signals.length > 0) {
+      try {
+        for (const sig of new_signals.signals) {
+          const journalEntry = {
+            id: `journal_${Date.now()}_${sig.symbol.replace('/', '')}`,
+            timestamp: new Date().toISOString(),
+            symbol: sig.symbol,
+            side: sig.side,
+            entry_price: sig.entry,
+            stop_loss: sig.stop_loss,
+            target_1: sig.targets?.t1,
+            target_2: sig.targets?.t2,
+            reason: sig.why_this_pair || '',
+            sentiment: sig.sentiment?.status || 'NEUTRAL',
+            status: 'OPEN', // OPEN, WIN, LOSS, CLOSED
+            pnl: 0
+          };
+          await db.collection('trading_journal').doc(journalEntry.id).set(journalEntry);
+        }
+        console.log(`✅ Saved ${new_signals.signals.length} signals to Trading Journal.`);
+      } catch (err: any) {
+        console.error("Failed to save to Trading Journal:", err.message);
+      }
+    }
+    // --- END NEW ---
 
     const payloads = renderDecisionCardsToTelegram(cards, se, gg, new_signals, archiveUrl);
 
@@ -1704,9 +1917,11 @@ export function normalizeActionInput(rawAction: string): { action: string, extra
     let action = "";
     const sortedAliases = Object.keys(aliasMap).sort((a, b) => b.length - a.length);
     for (const alias of sortedAliases) {
-        if (s.includes(alias)) {
+        // Use word boundary to avoid matching inside other words (e.g., "AL" in "ANALISA")
+        const regex = new RegExp(`\\b${alias.replace(/ /g, '\\s+')}\\b`, 'i');
+        if (regex.test(s)) {
             action = aliasMap[alias];
-            s = s.replace(alias, ' ').trim();
+            s = s.replace(regex, ' ').trim();
             break;
         }
     }
@@ -1974,8 +2189,15 @@ function renderDecisionCardsToTelegram(cards: any[], server_enforce: any, global
                 signalMsg += `SL: ${sig.stop_loss}\n`;
                 signalMsg += `TP1: ${sig.targets.t1} (RR: ${sig.rr.t1_rr})\n`;
                 signalMsg += `TP2: ${sig.targets.t2} (RR: ${sig.rr.t2_rr})\n`;
+                
+                if (sig.sentiment) {
+                    const sentIcon = sig.sentiment.status === 'BULLISH' ? '📈' : (sig.sentiment.status === 'BEARISH' ? '📉' : '⚖️');
+                    signalMsg += `\n${sentIcon} <b>Sentiment: ${sig.sentiment.status} (${sig.sentiment.score_1_to_10}/10)</b>\n`;
+                    signalMsg += `<i>${escapeHtml(sig.sentiment.reason)}</i>\n`;
+                }
+
                 if (sig.confluence) {
-                    signalMsg += `<i>${escapeHtml(sig.confluence.notes)}</i>\n`;
+                    signalMsg += `\n<i>${escapeHtml(sig.confluence.notes)}</i>\n`;
                 }
                 signalMsg += `\n`;
             }
@@ -2058,6 +2280,19 @@ app.get('/api/debug-env', (req, res) => {
     TELEGRAM_BOT_TOKEN: TELEGRAM_BOT_TOKEN ? 'Set' : 'Missing',
     GEMINI_API_KEY: GEMINI_API_KEY ? 'Set' : 'Missing',
   });
+});
+
+app.get('/api/journal', async (req, res) => {
+  if (!db) {
+    return res.status(500).json({ error: 'Firestore not initialized' });
+  }
+  try {
+    const snapshot = await db.collection('trading_journal').orderBy('timestamp', 'desc').limit(100).get();
+    const journal = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    res.json({ journal });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.post('/api/bot/toggle', async (req, res) => {
@@ -2157,7 +2392,9 @@ app.get('/api/positions', async (req, res) => {
   }
 });
 
-async function generateAiReply(userMessage: string) {
+const chatHistories: Record<string, { role: string, content: string }[]> = {};
+
+async function generateAiReply(userMessage: string, chatId: string = 'default', base64Image: string | null = null) {
   let positions = [];
   let openOrders = [];
   let marketData: any = {};
@@ -2206,21 +2443,61 @@ async function generateAiReply(userMessage: string) {
   const accountRisk = await fetchAccountRisk();
   const latestSignal = signals.length > 0 ? signals[signals.length - 1].content : 'Belum ada sinyal.';
 
+  // Fetch history from Firestore
+  let chatHistory: { role: string, content: string }[] = [];
+  if (db) {
+    try {
+      const chatDoc = await db.collection('telegram_chats').doc(chatId.toString()).get();
+      if (chatDoc.exists) {
+        chatHistory = chatDoc.data()?.history || [];
+      }
+    } catch (err) {
+      console.error("Error reading chat history from Firestore:", err);
+    }
+  } else {
+    // Fallback to RAM if db is not initialized
+    if (!chatHistories[chatId]) {
+      chatHistories[chatId] = [];
+    }
+    chatHistory = chatHistories[chatId];
+  }
+  
+  // Format history for prompt
+  const historyText = chatHistory.length > 0 
+    ? "Riwayat Percakapan Sebelumnya:\n" + chatHistory.map(h => `${h.role === 'user' ? 'Pengguna' : 'Sentinel'}: ${h.content}`).join('\n') + "\n\n"
+    : "";
+
   const prompt = `
     Anda adalah “Crypto Sentinel V2 – Supervisory Sentinel”.
+
+    [INSTRUKSI SANGAT PENTING - BACA INI DAHULU SEBELUM MELIHAT DATA]
+    Tugas pertama Anda adalah mengidentifikasi niat (intent) dari pesan pengguna berikut:
+    "${userMessage}"
+
+    ATURAN MUTLAK:
+    1. Jika pengguna HANYA bertanya, berdiskusi, meminta penjelasan atas analisa sebelumnya, mempertanyakan indikator, atau menyapa:
+       -> JAWABLAH SECARA NATURAL SEPERTI MANUSIA.
+       -> JELASKAN ALASAN ANDA JIKA DITANYA (misal: "Saya menggunakan data dari Binance API dan indikator teknikal internal...").
+       -> JANGAN PERNAH memberikan analisa portofolio, rekomendasi trading, atau menggunakan format poin-poin (1, 2, 3) jika tidak diminta.
+       -> ABAIKAN SEMUA DATA PASAR DAN AKUN DI BAWAH INI.
+
+    2. HANYA JIKA pengguna secara eksplisit meminta analisa koin, saran recovery, atau bertanya "bagaimana portofolio saya?":
+       -> Barulah Anda boleh menggunakan data di bawah ini dan membalas dengan format "ANALISA KOIN BARU" atau "RECOVERY POSISI".
+
+    ========================================================
+    DATA AKUN & PASAR (HANYA GUNAKAN JIKA DIMINTA ANALISA)
+    ========================================================
     Fokus Utama: HEDGING RECOVERY BY ZONE.
     Gaya Trading Pengguna: HEDGING RECOVERY MODE. Pengguna MEMINIMALKAN CUT LOSS dan lebih memilih melakukan Hedging (membuka posisi Long dan Short bersamaan) untuk melakukan recovery pada posisi yang sedang floating loss.
     
-    Tugas Anda adalah memberikan saran supervisi yang objektif berdasarkan data akun dan pasar.
-
-    Data Akun & Risiko (PENTING):
+    Data Akun & Risiko:
     - Margin Ratio: ${accountRisk ? accountRisk.marginRatio.toFixed(2) + '%' : 'N/A'} (Maksimal Aman: 25%)
     - Saldo Wallet: $${accountRisk ? accountRisk.walletBalance.toFixed(2) : 'N/A'}
     - Margin Tersedia: $${accountRisk ? accountRisk.marginAvailable.toFixed(2) : 'N/A'}
     - PnL Belum Terealisasi: $${accountRisk ? accountRisk.unrealizedPnl.toFixed(2) : 'N/A'}
     - PnL Terealisasi (24j): $${accountRisk ? accountRisk.dailyRealizedPnl.toFixed(2) : 'N/A'}
 
-    ATURAN MANAJEMEN RISIKO (WAJIB DIPATUHI):
+    ATURAN MANAJEMEN RISIKO (WAJIB DIPATUHI JIKA MEMBERIKAN ANALISA):
     - JANGAN menyarankan posisi BARU jika Margin Ratio saat ini > 25%, kecuali untuk tujuan Hedging penyelamatan darurat.
     - Jika Margin Ratio > 25%, fokuskan saran pada pengurangan risiko.
 
@@ -2238,11 +2515,13 @@ async function generateAiReply(userMessage: string) {
     
     Analisis Terakhir Anda: ${latestSignal}
 
-    Pengguna bertanya/berkata: "${userMessage}"
+    ${historyText}
+    Pesan Pengguna Saat Ini: "${userMessage}"
 
-    Berikan jawaban yang membantu, ringkas, dan relevan dengan konteks trading di atas. Gunakan Bahasa Indonesia.
-    
-    KONSEP UTAMA (WAJIB DIPAHAMI):
+    ========================================================
+    PANDUAN STRATEGI (HANYA JIKA MEMBERIKAN ANALISA)
+    ========================================================
+    KONSEP UTAMA:
     Strategi Recovery ini menggunakan konsep "Recovery by Zone (Supply–Demand–Pivot–StopHedge)" sebagai SOP utama.
     - Menyesuaikan strategi: SupplyHigh/Low → zona jual ideal, DemandHigh/Low → zona beli ideal, Pivot → equilibrium untuk reduce, StopHedge → invalidasi lock.
     - Pola Zone Strategy: Lock at Extremes, Release at Pivot, Reduce di Mid-Range, Add di Edge, Hold Lock jika harga di tengah, Recovery mode jika harga kembali ke Demand/Supply.
@@ -2300,8 +2579,28 @@ async function generateAiReply(userMessage: string) {
     Jika pengguna bertanya tentang posisi mereka, berikan saran spesifik untuk kaki Long dan Short sesuai strategi Recovery by Zone (Supply–Demand–Pivot–StopHedge) di atas.
     Jadikan indikator "RangeFilter" pada TF_4H sebagai acuan UTAMA Anda untuk melihat tren.
     Gunakan TF_1H dan TF_15m (SMC, RSI) untuk mencari titik masuk/keluar (entry/exit) yang lebih presisi.
+
+    ========================================================
+    FORMAT JAWABAN (HANYA JIKA DIMINTA ANALISA)
+    ========================================================
+    Jika pengguna bertanya tentang reversal/pullback berikan output berdasarkan Paket “Institutional Reversal Detector” dan berikan jawaban dengan bahasa trading profesional, jelas, dan praktis:
+    A. Rangkuman Reversal/Pullback
+       - Apakah sedang reversal valid, reversal lemah, hanya pullback, atau masih trending.
+    B. Level Penting
+       - Zona OB yang relevan
+       - Area liquidity sweep
+       - Level Fibo utama
+       - Reaksi pada MA50/200
+    C. KONKLUSI UNTUK HEDGING RECOVERY
+       Berikan rekomendasi:
+     - “Sinyal UNLOCK kuat”
+     - “UNLOCK hati-hati, konfirmasi belum lengkap”
+     - “Lebih baik tetap LOCK”
+     - “Disarankan tambah hedge kecil (step)”
+     - “Area terbaik ambil TP untuk salah satu sisi”
+     - “Waspada reversal palsu”
     
-    STRUKTUR JAWABAN WAJIB (Jika memberikan rekomendasi posisi baru / analisa koin spesifik):
+    FORMAT ANALISA KOIN BARU (Hanya jika diminta secara eksplisit):
     1. Analisis Tren & Struktur SMC: Sebutkan Tren 4H, BOS/CHOCH, dan Liquidity.
     2. Rekomendasi Aksi: ENTRY LONG, ENTRY SHORT, atau HOLD (Wait and See).
     3. Titik Harga Masuk (SMC di TF Kecil):
@@ -2310,8 +2609,9 @@ async function generateAiReply(userMessage: string) {
     4. Target Profit (TP) & Manajemen Risiko:
        - Sebutkan level TP berdasarkan Liquidity/Supply/Demand.
        - Tentukan "Harga Stop Loss / Stop Hedge" (Titik Invalidation).
+    5. Rangkuman Reversal/Pullback 
 
-    STRUKTUR JAWABAN WAJIB (Jika memberikan rekomendasi recovery posisi yang sudah ada):
+    FORMAT RECOVERY POSISI (Hanya jika diminta secara eksplisit):
     1. Analisis Margin & Tren: Sebutkan Margin Ratio dan Tren 4H saat ini.
     2. Rencana Eksekusi: Jelaskan aksi (ADD/REDUCE) dan jumlah unitnya.
     3. Titik Harga Masuk (SMC di TF Kecil):
@@ -2320,13 +2620,38 @@ async function generateAiReply(userMessage: string) {
     4. Manajemen Risiko (Stop Hedge):
        - Tentukan "Harga Stop Hedge" (Titik Invalidation).
        - Jelaskan aksi jika harga menyentuh titik ini (misal: "Lock Kembali ke 1:1").
+    5. Rangkuman Reversal/Pullback
     
     Format dalam PLAIN TEXT, gunakan emoji secukupnya. JANGAN gunakan Markdown (tanpa bintang, tanpa garis bawah).
   `;
 
   try {
-    const reply = await generateWithRetry(prompt, 'gemini-3-flash-preview');
-    return reply || 'Maaf, saya tidak dapat memproses permintaan Anda saat ini.';
+    const reply = await generateWithRetry(prompt, base64Image ? 'gemini-3-flash-preview' : 'gemini-3.1-pro-preview', 3, false, base64Image);
+    const finalReply = reply || 'Maaf, saya tidak dapat memproses permintaan Anda saat ini.';
+    
+    // Save to history
+    chatHistory.push({ role: 'user', content: userMessage });
+    chatHistory.push({ role: 'model', content: finalReply });
+    
+    // Keep only last 10 messages
+    if (chatHistory.length > 10) {
+      chatHistory = chatHistory.slice(-10);
+    }
+    
+    if (db) {
+      try {
+        await db.collection('telegram_chats').doc(chatId.toString()).set({
+          history: chatHistory,
+          updatedAt: new Date()
+        }, { merge: true });
+      } catch (err) {
+        console.error("Error saving chat history to Firestore:", err);
+      }
+    } else {
+      chatHistories[chatId] = chatHistory;
+    }
+    
+    return finalReply;
   } catch (error: any) {
     console.error('AI Reply Error:', error);
     return 'Maaf, terjadi kesalahan saat menghubungi AI (Sistem sedang sibuk, silakan coba lagi beberapa saat).';
@@ -3214,11 +3539,11 @@ async function pollTelegram() {
             // Send Result
             await sendTelegramMessage(resultMsg);
 
-        // Handle Text Messages
-        } else if (update.message && update.message.text) {
+        // Handle Text Messages, Photos, and Voice
+        } else if (update.message && (update.message.text || update.message.photo || update.message.voice)) {
           const chatId = update.message.chat.id.toString();
           if (chatId === TELEGRAM_CHAT_ID) {
-            const userText = update.message.text.trim();
+            let userText = update.message.text ? update.message.text.trim() : (update.message.caption ? update.message.caption.trim() : '');
             
             // De-dup by message id
             const dedupKey = `msg_${update.message.message_id}`;
@@ -3226,6 +3551,64 @@ async function pollTelegram() {
                 console.log(`[TG DEDUP] Skipping duplicate message: ${dedupKey}`);
                 continue;
             }
+
+            // --- NEW: Handle Voice Message ---
+            if (update.message.voice) {
+              try {
+                await sendTelegramMessage("🎙️ <i>Mendengarkan perintah suara Anda...</i>");
+                
+                const fileId = update.message.voice.file_id;
+                const fileRes = await axios.get(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`);
+                const filePath = fileRes.data.result.file_path;
+                const downloadRes = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`, {
+                  responseType: 'arraybuffer'
+                });
+                
+                const base64Audio = Buffer.from(downloadRes.data, 'binary').toString('base64');
+                
+                const prompt = `
+Anda adalah asisten trading kripto. Dengarkan pesan suara ini.
+Tugas Anda:
+1. Transkripsi pesan suara tersebut.
+2. Ekstrak niat (intent) trading jika ada.
+Format balasan WAJIB berupa JSON:
+{
+  "transcription": "Teks yang Anda dengar",
+  "intent": {
+    "action": "REDUCE_LONG|REDUCE_SHORT|ADD_LONG|ADD_SHORT|LOCK_NEUTRAL|UNLOCK|HOLD|TAKE_PROFIT",
+    "symbol": "BTC/USDT" (harus format ini),
+    "percentage": 100 (angka 1-100)
+  } // Isi null jika tidak ada perintah trading yang jelas
+}
+`;
+                const ai = getAI();
+                const response = await ai.models.generateContent({
+                  model: 'gemini-3-flash-preview',
+                  contents: {
+                    parts: [
+                      { inlineData: { mimeType: 'audio/ogg', data: base64Audio } },
+                      { text: prompt }
+                    ]
+                  },
+                  config: { responseMimeType: 'application/json' }
+                });
+                
+                const result = JSON.parse(response.text || '{}');
+                await sendTelegramMessage(`🗣️ <b>Transkripsi:</b> "${result.transcription}"`);
+                
+                if (result.intent && result.intent.action && result.intent.symbol) {
+                  userText = `${result.intent.action} ${result.intent.symbol} ${result.intent.percentage || 100}%`;
+                  await sendTelegramMessage(`⚙️ <b>Mengeksekusi:</b> ${userText}`);
+                } else {
+                  userText = result.transcription; // Treat as normal chat
+                }
+              } catch (err: any) {
+                console.error("Voice processing error:", err.message);
+                await sendTelegramMessage("❌ Gagal memproses pesan suara.");
+                continue;
+              }
+            }
+            // --- END Voice Message ---
 
             if (userText === '/help' || userText === '/commands') {
                 const msg = `🤖 <b>Trading Bot Commands</b>\n\n` +
@@ -3321,7 +3704,12 @@ async function pollTelegram() {
 
             // Try parsing as trade command first
             const parsedText = normalizeActionInput(userText);
-            if (parsedText.action && parsedText.extractedSymbol) {
+            // Only treat as trade command if it's relatively short or starts with a slash
+            // Long messages are likely natural language requests for the AI
+            const isLikelyTradeCommand = (userText.length < 150 || userText.startsWith('/')) && 
+                                         parsedText.action && parsedText.extractedSymbol;
+
+            if (isLikelyTradeCommand) {
                 console.log(`\n--- TG EVENT ---`);
                 console.log(`[TG UPDATE ID] ${update.update_id}`);
                 console.log(`[TG MESSAGE ID] ${update.message.message_id}`);
@@ -3346,7 +3734,34 @@ async function pollTelegram() {
               action: 'typing'
             }).catch(() => {});
             
-            const reply = await generateAiReply(userText);
+            const chatId = update.message.chat.id.toString();
+            
+            let base64Image = null;
+            if (update.message.photo && update.message.photo.length > 0) {
+              try {
+                // Get the highest resolution photo
+                const photo = update.message.photo[update.message.photo.length - 1];
+                const fileId = photo.file_id;
+                
+                // Get file path
+                const fileRes = await axios.get(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`);
+                const filePath = fileRes.data.result.file_path;
+                
+                // Download file
+                const downloadRes = await axios.get(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`, {
+                  responseType: 'arraybuffer'
+                });
+                
+                base64Image = Buffer.from(downloadRes.data, 'binary').toString('base64');
+                console.log(`[TG PHOTO] Successfully downloaded and converted photo to base64`);
+              } catch (err) {
+                console.error(`[TG PHOTO ERROR] Failed to process photo:`, err);
+                await sendTelegramMessage(`❌ Gagal memproses gambar. Silakan coba lagi.`);
+                continue;
+              }
+            }
+
+            const reply = await generateAiReply(userText, chatId, base64Image);
             await sendTelegramMessage(`🤖 <b>AI Reply:</b>\n\n${escapeHtml(reply)}`);
           }
         }
@@ -3401,6 +3816,198 @@ async function pollTelegram() {
       res.status(500).json({ success: false, error: error.message });
     }
   });
+
+// --- AUTO-JOURNALING FEATURE ---
+async function generateAutoJournal() {
+  console.log("📝 Generating Auto-Journal...");
+  try {
+    if (!BINANCE_API_KEY || !BINANCE_API_SECRET || !db) {
+      console.log("Skipping auto-journal: Binance API or Firestore not configured.");
+      return;
+    }
+
+    const activeClient = VALIDATION_MODE === "DEMO_TRADING" ? binanceDemo : binance;
+    const now = Date.now();
+    const startTime = now - 12 * 60 * 60 * 1000; // Last 12 hours
+
+    // Fetch Realized PnL
+    const income = await (activeClient as any).fapiPrivateGetIncome({
+      incomeType: 'REALIZED_PNL',
+      startTime,
+      limit: 1000
+    });
+
+    let totalProfit = 0;
+    let totalLoss = 0;
+    let winCount = 0;
+    let lossCount = 0;
+    const tradedSymbols = new Set<string>();
+
+    for (const trade of income) {
+      const pnl = parseFloat(trade.income);
+      tradedSymbols.add(trade.symbol);
+      if (pnl > 0) {
+        totalProfit += pnl;
+        winCount++;
+      } else if (pnl < 0) {
+        totalLoss += pnl;
+        lossCount++;
+      }
+    }
+
+    const netPnl = totalProfit + totalLoss;
+    const totalTrades = winCount + lossCount;
+    const winRate = totalTrades > 0 ? ((winCount / totalTrades) * 100).toFixed(2) : "0.00";
+
+    if (totalTrades === 0) {
+      const msg = `📝 <b>Jurnal Trading Otomatis (12 Jam Terakhir)</b>\n\nTidak ada posisi yang ditutup dalam 12 jam terakhir. Tetap sabar menunggu setup terbaik! 🛡️`;
+      if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+        await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+          chat_id: TELEGRAM_CHAT_ID,
+          text: msg,
+          parse_mode: 'HTML'
+        });
+      }
+      return;
+    }
+
+    const prompt = `
+      Anda adalah "Crypto Sentinel V2 - Mentor Trading Profesional".
+      Tugas Anda adalah membuat Jurnal Evaluasi Trading berdasarkan data 12 jam terakhir berikut:
+
+      - Total Trade Ditutup: ${totalTrades}
+      - Win Rate: ${winRate}% (${winCount} Win / ${lossCount} Loss)
+      - Total Profit (Kotor): $${totalProfit.toFixed(2)}
+      - Total Loss (Kotor): $${totalLoss.toFixed(2)}
+      - Net PnL: $${netPnl.toFixed(2)}
+      - Koin yang ditradingkan: ${Array.from(tradedSymbols).join(', ')}
+
+      Buatlah evaluasi singkat (maksimal 3 paragraf pendek) yang berisi:
+      1. Ringkasan performa (apakah bagus, buruk, atau biasa saja).
+      2. Insight/Pelajaran yang bisa diambil dari angka-angka tersebut (misal: jika win rate rendah tapi profit, berarti risk/reward bagus. Jika loss besar, ingatkan soal cut loss).
+      3. Pesan motivasi atau peringatan psikologis untuk sesi trading 12 jam berikutnya.
+
+      Gunakan bahasa Indonesia yang profesional, tegas, namun memotivasi ala mentor trading elit. Jangan gunakan format markdown tebal (**) berlebihan, gunakan secukupnya.
+    `;
+
+    const evaluation = await generateWithRetry(prompt, 'gemini-3-flash-preview');
+    
+    const journalData = {
+      timestamp: new Date().toISOString(),
+      period: "12h",
+      totalTrades,
+      winRate: parseFloat(winRate),
+      netPnl,
+      tradedSymbols: Array.from(tradedSymbols),
+      evaluation
+    };
+
+    // Save to Firestore
+    await db.collection('journal_summaries').add(journalData);
+
+    // Send to Telegram
+    const tgMsg = `📝 <b>Jurnal Trading Sentinel (12 Jam Terakhir)</b>\n\n` +
+      `📊 <b>Statistik:</b>\n` +
+      `• Net PnL: <b>$${netPnl.toFixed(2)}</b>\n` +
+      `• Win Rate: <b>${winRate}%</b> (${winCount}W / ${lossCount}L)\n` +
+      `• Koin: ${Array.from(tradedSymbols).join(', ')}\n\n` +
+      `🧠 <b>Evaluasi Mentor:</b>\n${evaluation}`;
+
+    if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+      await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        chat_id: TELEGRAM_CHAT_ID,
+        text: tgMsg,
+        parse_mode: 'HTML'
+      });
+    }
+
+  } catch (err) {
+    console.error("Error generating auto journal:", err);
+  }
+}
+
+// Schedule Auto-Journaling at 07:30 and 19:30 WIB (Asia/Jakarta)
+cron.schedule('30 7,19 * * *', generateAutoJournal, {
+  timezone: "Asia/Jakarta"
+});
+
+// --- PROACTIVE RISK MANAGER ---
+let lastRiskAlerts: Record<string, number> = {}; // symbol -> timestamp
+
+async function checkRiskAndNotify() {
+  if (!BINANCE_API_KEY || !BINANCE_API_SECRET || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+  
+  try {
+    const activeClient = VALIDATION_MODE === "DEMO_TRADING" ? binanceDemo : binance;
+    const positions = await activeClient.fetchPositions();
+    const openPositions = positions.filter((p: any) => p.contracts > 0);
+    
+    if (openPositions.length === 0) return;
+
+    const riskData = await fetchAccountRisk();
+    if (!riskData) return;
+
+    const now = Date.now();
+    const ALERT_COOLDOWN = 60 * 60 * 1000; // 1 hour cooldown per symbol
+
+    let alertTriggered = false;
+    let alertReason = "";
+
+    // Check 1: Margin Ratio Danger
+    if (riskData.marginRatio > 80) {
+      alertTriggered = true;
+      alertReason += `⚠️ <b>BAHAYA LIKUIDASI!</b> Margin Ratio mencapai ${riskData.marginRatio.toFixed(2)}%. Segera tambah margin atau kurangi posisi.\n`;
+    }
+
+    // Check 2: High Floating Loss or High Profit
+    for (const pos of openPositions) {
+      const pnl = pos.unrealizedPnl || 0;
+      const initialMargin = pos.initialMargin || (pos.notional / (pos.leverage || 1));
+      const roe = initialMargin > 0 ? (pnl / initialMargin) * 100 : 0;
+
+      const lastAlert = lastRiskAlerts[pos.symbol] || 0;
+      if (now - lastAlert < ALERT_COOLDOWN) continue; // Skip if recently alerted
+
+      if (roe < -20) {
+        alertTriggered = true;
+        alertReason += `🚨 <b>DRAWDOWN WARNING:</b> Posisi ${pos.side} ${pos.symbol} sedang floating minus <b>${roe.toFixed(2)}%</b> ($${pnl.toFixed(2)}). Waktunya evaluasi Cut Loss atau Hedging!\n`;
+        lastRiskAlerts[pos.symbol] = now;
+      } else if (roe > 50) {
+        alertTriggered = true;
+        alertReason += `💰 <b>PROFIT SECURE:</b> Posisi ${pos.side} ${pos.symbol} sudah profit <b>+${roe.toFixed(2)}%</b> ($${pnl.toFixed(2)}). Pertimbangkan untuk Take Profit parsial atau pasang Trailing Stop.\n`;
+        lastRiskAlerts[pos.symbol] = now;
+      }
+    }
+
+    if (alertTriggered) {
+      const prompt = `
+        Anda adalah "Crypto Sentinel V2 - Risk Manager".
+        Sistem mendeteksi kondisi berikut pada akun pengguna:
+        ${alertReason}
+
+        Buatlah pesan teguran/peringatan singkat (maksimal 2 paragraf) untuk dikirim ke Telegram pengguna.
+        Gunakan gaya bahasa mentor trading yang tegas, proaktif, dan mengingatkan soal psikologi trading (jangan serakah, jangan takut cut loss).
+        Format dalam PLAIN TEXT dengan emoji secukupnya.
+      `;
+
+      const aiMessage = await generateWithRetry(prompt, 'gemini-3-flash-preview');
+      
+      const tgMsg = `🛡️ <b>SENTINEL PROACTIVE ALERT</b> 🛡️\n\n${alertReason}\n🧠 <b>Saran Mentor:</b>\n${aiMessage}`;
+      
+      await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        chat_id: TELEGRAM_CHAT_ID,
+        text: tgMsg,
+        parse_mode: 'HTML'
+      });
+    }
+
+  } catch (err) {
+    console.error("Error in checkRiskAndNotify:", err);
+  }
+}
+
+// Schedule Risk Manager every 10 minutes
+// cron.schedule('*/10 * * * *', checkRiskAndNotify);
 
 app.listen(PORT, '0.0.0.0', async () => {
     console.log(`Server running on http://localhost:${PORT}`);

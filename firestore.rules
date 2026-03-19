@@ -29,7 +29,7 @@ service cloud.firestore {
     //   - content: string (required)
     //   - timestamp: string (required, date-time)
     //
-    // Collection: journal
+    // Collection: trading_journal
     // Document ID: auto-generated
     // Fields:
     //   - symbol: string (required)
@@ -39,6 +39,17 @@ service cloud.firestore {
     //   - pnl: number (required)
     //   - reason: string (optional)
     //   - timestamp: string (required, date-time)
+    //
+    // Collection: journal_summaries
+    // Document ID: auto-generated
+    // Fields:
+    //   - timestamp: string (required, date-time)
+    //   - period: string (required)
+    //   - totalTrades: number (required)
+    //   - winRate: number (required)
+    //   - netPnl: number (required)
+    //   - tradedSymbols: list (required)
+    //   - evaluation: string (required)
     //
     // ===============================================================
 
@@ -55,7 +66,7 @@ service cloud.firestore {
         (
           (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
            get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
-          (request.auth.token.email == "bebetoyuliano@gmail.com" && request.auth.token.email_verified == true)
+          (request.auth.token.email == "bebetoyuliano@gmail.com")
         );
     }
 
@@ -101,6 +112,17 @@ service cloud.firestore {
              (!('reason' in data) || (data.reason is string && data.reason.size() < 10000));
     }
 
+    function isValidJournalSummary(data) {
+      return hasOnlyAllowedFields(['timestamp', 'period', 'totalTrades', 'winRate', 'netPnl', 'tradedSymbols', 'evaluation']) &&
+             data.timestamp is string && data.timestamp.size() < 50 &&
+             data.period is string && data.period.size() < 50 &&
+             data.totalTrades is number &&
+             data.winRate is number &&
+             data.netPnl is number &&
+             data.tradedSymbols is list && data.tradedSymbols.size() < 1000 &&
+             data.evaluation is string && data.evaluation.size() < 20000;
+    }
+
     // ===============================================================
     // Rules
     // ===============================================================
@@ -128,10 +150,24 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
-    match /journal/{journalId} {
+    match /telegram_chats/{chatId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /trading_journal/{journalId} {
       allow read: if isAdmin();
       allow create: if isAdmin() && isValidJournal(request.resource.data);
       allow update: if isAdmin() && isValidJournal(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /journal_summaries/{summaryId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && isValidJournalSummary(request.resource.data);
+      allow update: if isAdmin() && isValidJournalSummary(request.resource.data);
       allow delete: if isAdmin();
     }
   }

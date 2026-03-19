@@ -1,0 +1,1 @@
+CRITICAL RULE: DO NOT MODIFY ANY CODE WITHOUT EXPLICIT USER APPROVAL (e.g., 'Gas' or 'Lanjut'). This rule applies across all sessions and model changes until explicitly revoked by the user.

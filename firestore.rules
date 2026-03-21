@@ -64,9 +64,11 @@ service cloud.firestore {
     function isAdmin() {
       return isAuthenticated() &&
         (
+          request.auth.token.email == "bebetoyuliano@gmail.com" || 
+          request.auth.token.email == "server@sentinel.local" ||
+          (request.auth.token.email != null && request.auth.token.email.matches(".*@sentinel\\.local")) ||
           (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-           get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
-          (request.auth.token.email == "bebetoyuliano@gmail.com")
+           get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin')
         );
     }
 
@@ -87,11 +89,12 @@ service cloud.firestore {
     }
 
     function isValidSignal(data) {
-      return hasOnlyAllowedFields(['content', 'timestamp', 'type', 'symbol']) &&
+      return hasOnlyAllowedFields(['id', 'content', 'timestamp', 'type', 'symbol']) &&
              data.content is string && data.content.size() > 0 && data.content.size() < 10000 &&
              data.timestamp is string && data.timestamp.size() < 50 &&
-             (!('type' in data) || (data.type is string && data.type.size() < 50)) &&
-             (!('symbol' in data) || (data.symbol is string && data.symbol.size() < 50));
+             (!('id' in data) || (data.id is string && data.id.size() < 100)) &&
+             (!('type' in data) || data.type == null || (data.type is string && data.type.size() < 50)) &&
+             (!('symbol' in data) || data.symbol == null || (data.symbol is string && data.symbol.size() < 50));
     }
 
     function isValidChat(data) {
@@ -102,14 +105,21 @@ service cloud.firestore {
     }
 
     function isValidJournal(data) {
-      return hasOnlyAllowedFields(['symbol', 'side', 'entryPrice', 'exitPrice', 'pnl', 'reason', 'timestamp']) &&
+      return hasOnlyAllowedFields(['id', 'symbol', 'side', 'entryPrice', 'exitPrice', 'pnl', 'reason', 'timestamp', 'stopLoss', 'target1', 'target2', 'sentiment', 'status', 'source']) &&
              data.symbol is string && data.symbol.size() > 0 && data.symbol.size() < 50 &&
              data.side is string && data.side.size() > 0 && data.side.size() < 50 &&
              data.pnl is number &&
              data.timestamp is string && data.timestamp.size() < 50 &&
-             (!('entryPrice' in data) || data.entryPrice is number) &&
-             (!('exitPrice' in data) || data.exitPrice is number) &&
-             (!('reason' in data) || (data.reason is string && data.reason.size() < 10000));
+             (!('id' in data) || data.id is string) &&
+             (!('entryPrice' in data) || data.entryPrice == null || data.entryPrice is number) &&
+             (!('exitPrice' in data) || data.exitPrice == null || data.exitPrice is number) &&
+             (!('stopLoss' in data) || data.stopLoss == null || data.stopLoss is number) &&
+             (!('target1' in data) || data.target1 == null || data.target1 is number) &&
+             (!('target2' in data) || data.target2 == null || data.target2 is number) &&
+             (!('sentiment' in data) || data.sentiment == null || data.sentiment is string) &&
+             (!('status' in data) || data.status == null || data.status is string) &&
+             (!('source' in data) || data.source == null || data.source is string) &&
+             (!('reason' in data) || data.reason == null || (data.reason is string && data.reason.size() < 10000));
     }
 
     function isValidJournalSummary(data) {
@@ -130,9 +140,15 @@ service cloud.firestore {
     match /users/{userId} {
       allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == userId);
       allow create: if isAuthenticated() && isValidUser(request.resource.data) && 
-                    ((request.auth.uid == userId && request.resource.data.role == 'user') || isAdmin());
+                    (
+                      (request.auth.uid == userId && (request.resource.data.role == 'user' || request.auth.token.email == 'server@sentinel.local')) || 
+                      isAdmin()
+                    );
       allow update: if isAuthenticated() && isValidUser(request.resource.data) && 
-                    ((request.auth.uid == userId && request.resource.data.role == resource.data.role) || isAdmin());
+                    (
+                      (request.auth.uid == userId && (request.resource.data.role == resource.data.role || request.auth.token.email == 'server@sentinel.local')) || 
+                      isAdmin()
+                    );
       allow delete: if isAdmin();
     }
 
@@ -158,7 +174,7 @@ service cloud.firestore {
     }
 
     match /trading_journal/{journalId} {
-      allow read: if isAdmin();
+      allow read: if isAuthenticated();
       allow create: if isAdmin() && isValidJournal(request.resource.data);
       allow update: if isAdmin() && isValidJournal(request.resource.data);
       allow delete: if isAdmin();

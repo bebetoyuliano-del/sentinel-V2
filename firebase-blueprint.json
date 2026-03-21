@@ -60,12 +60,19 @@
       "description": "Trading journal entry",
       "type": "object",
       "properties": {
+        "id": { "type": "string" },
         "symbol": { "type": "string" },
         "side": { "type": "string" },
         "entryPrice": { "type": "number" },
         "exitPrice": { "type": "number" },
+        "stopLoss": { "type": "number" },
+        "target1": { "type": "number" },
+        "target2": { "type": "number" },
         "pnl": { "type": "number" },
         "reason": { "type": "string" },
+        "sentiment": { "type": "string" },
+        "status": { "type": "string" },
+        "source": { "type": "string" },
         "timestamp": { "type": "string", "format": "date-time" }
       },
       "required": ["symbol", "side", "pnl", "timestamp"]

@@ -54,6 +54,24 @@ export default function App() {
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [journal, setJournal] = useState<any[]>([]);
+  const [isSyncing, setIsSyncing] = useState(false);
+
+  const handleSync = async () => {
+    setIsSyncing(true);
+    try {
+      const res = await fetch('/api/journal/sync', { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        alert(`Successfully synced ${data.syncedCount} trades from Binance.`);
+      } else {
+        alert(`Failed to sync: ${data.error}`);
+      }
+    } catch (err: any) {
+      alert(`Error syncing: ${err.message}`);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
@@ -606,6 +624,17 @@ export default function App() {
                 </div>
               ) : activeTab === 'journal' ? (
                 <div className="space-y-4">
+                  <div className="flex justify-between items-center mb-4">
+                    <h3 className="text-lg font-bold">Trading Journal</h3>
+                    <button
+                      onClick={handleSync}
+                      disabled={isSyncing}
+                      className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-sm rounded-lg flex items-center gap-2 transition-colors disabled:opacity-50"
+                    >
+                      <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
+                      {isSyncing ? 'Syncing...' : 'Sync History'}
+                    </button>
+                  </div>
                   {journal.length > 0 && (
                     <div className="grid grid-cols-3 gap-4 mb-4">
                       <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
@@ -621,7 +650,7 @@ export default function App() {
                       <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
                         <div className="text-xs text-zinc-500 mb-1">Avg PnL</div>
                         <div className={`text-2xl font-bold ${journal.reduce((acc, j) => acc + (j.pnl || 0), 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                          {(journal.reduce((acc, j) => acc + (j.pnl || 0), 0) / journal.length).toFixed(2)}%
+                          {(journal.reduce((acc, j) => acc + (j.pnl || 0), 0) / journal.length).toFixed(2)} USDT
                         </div>
                       </div>
                     </div>
@@ -638,10 +667,15 @@ export default function App() {
                         <div className="flex justify-between items-start mb-4">
                           <div>
                             <div className="flex items-center gap-2">
-                              <span className={`px-2 py-0.5 rounded text-xs font-medium ${entry.side === 'BUY' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>
+                              <span className={`px-2 py-0.5 rounded text-xs font-medium ${entry.side === 'BUY' || entry.side === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}`}>
                                 {entry.side}
                               </span>
                               <span className="font-bold text-lg">{entry.symbol}</span>
+                              {entry.source && (
+                                <span className={`px-2 py-0.5 rounded text-xs font-medium ${entry.source === 'AI' ? 'bg-indigo-500/20 text-indigo-400' : 'bg-zinc-500/20 text-zinc-400'}`}>
+                                  {entry.source === 'AI' ? 'AI Signal' : 'User Trade'}
+                                </span>
+                              )}
                             </div>
                             <div className="text-xs text-zinc-500 mt-1 font-mono">
                               {new Date(entry.timestamp).toLocaleString()}
@@ -649,9 +683,9 @@ export default function App() {
                           </div>
                           <div className={`text-right ${entry.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                             <div className="font-mono font-bold">
-                              {entry.pnl >= 0 ? '+' : ''}{entry.pnl?.toFixed(2) || '0.00'}%
+                              {entry.pnl >= 0 ? '+' : ''}{entry.pnl?.toFixed(2) || '0.00'} USDT
                             </div>
-                            <div className="text-xs opacity-70">Est. PnL</div>
+                            <div className="text-xs opacity-70">Realized PnL</div>
                           </div>
                         </div>
                         
@@ -662,11 +696,11 @@ export default function App() {
                           </div>
                           <div>
                             <div className="text-xs text-zinc-500">Stop Loss</div>
-                            <div className="font-mono text-sm text-rose-400">${entry.stopLoss}</div>
+                            <div className="font-mono text-sm text-rose-400">{entry.stopLoss ? `$${entry.stopLoss}` : '-'}</div>
                           </div>
                           <div>
                             <div className="text-xs text-zinc-500">Targets</div>
-                            <div className="font-mono text-sm text-emerald-400">{entry.targets?.join(', ')}</div>
+                            <div className="font-mono text-sm text-emerald-400">{entry.target1 ? `$${entry.target1}` : '-'}</div>
                           </div>
                         </div>
 

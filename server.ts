@@ -9,30 +9,146 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { RSI, MACD, EMA, BollingerBands, SMA } from 'technicalindicators';
 import { Storage } from '@google-cloud/storage';
-import { initializeApp, applicationDefault } from 'firebase-admin/app';
-import { getFirestore } from 'firebase-admin/firestore';
+import { initializeApp } from 'firebase/app';
+import { getFirestore, doc, setDoc, getDoc, collection, query, orderBy, limit, getDocs } from 'firebase/firestore';
+import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword } from 'firebase/auth';
 import fs from 'fs';
 import path from 'path';
 import cron from 'node-cron';
 
-// Initialize Firebase Admin
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const currentUser = auth?.currentUser;
+  const errInfo: any = {
+    error: error instanceof Error ? error.message : String(error),
+    authStatus: currentUser ? 'authenticated' : 'unauthenticated',
+    authInfo: currentUser ? {
+      userId: currentUser.uid,
+      email: currentUser.email,
+      emailVerified: currentUser.emailVerified,
+      isAnonymous: currentUser.isAnonymous,
+      providerInfo: currentUser.providerData.map((provider: any) => ({
+        providerId: provider.providerId,
+        email: provider.email
+      }))
+    } : null,
+    operationType,
+    path
+  };
+  console.error(`[Firestore Error] [${operationType}] [${path}]:`, JSON.stringify(errInfo));
+}
+
+// Initialize Firebase Client
 let db: any = null;
-try {
-  const firebaseConfig = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'firebase-applet-config.json'), 'utf8'));
-  const app = initializeApp({
-    credential: applicationDefault(),
-    projectId: firebaseConfig.projectId,
-  });
-  db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
-} catch (e) {
-  console.error("Failed to initialize Firebase Admin:", e);
+let auth: any = null;
+
+async function initFirebase() {
+  try {
+    const firebaseConfig = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'firebase-applet-config.json'), 'utf8'));
+    const app = initializeApp(firebaseConfig);
+    db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+    auth = getAuth(app);
+    
+    const serverEmail = 'server@sentinel.local';
+    const serverPassword = process.env.SERVER_PASSWORD || 'sentinel-server-secret-123';
+    
+    try {
+      console.log(`Attempting to sign in as ${serverEmail}...`);
+      const userCredential = await signInWithEmailAndPassword(auth, serverEmail, serverPassword);
+      console.log(`✅ Successfully signed in as ${serverEmail}. UID: ${userCredential.user.uid}`);
+      console.log(`Email verified: ${userCredential.user.emailVerified}`);
+    } catch (e: any) {
+      console.log(`Sign in failed with code: ${e.code}. Message: ${e.message}`);
+      if (e.code === 'auth/operation-not-allowed') {
+        console.error("❌ CRITICAL: Email/Password authentication is DISABLED in your Firebase Console.");
+        console.error("👉 ACTION REQUIRED: Go to Firebase Console > Authentication > Sign-in method and ENABLE 'Email/Password'.");
+        throw e;
+      } else if (e.code === 'auth/user-not-found' || e.code === 'auth/invalid-credential' || e.code === 'auth/wrong-password') {
+        console.log(`Attempting to create user ${serverEmail}...`);
+        try {
+          const userCredential = await createUserWithEmailAndPassword(auth, serverEmail, serverPassword);
+          console.log(`✅ Successfully created and signed in as ${serverEmail}. UID: ${userCredential.user.uid}`);
+        } catch (createErr: any) {
+          if (createErr.code === 'auth/operation-not-allowed') {
+            console.error("❌ CRITICAL: Email/Password authentication is DISABLED in your Firebase Console.");
+            console.error("👉 ACTION REQUIRED: Go to Firebase Console > Authentication > Sign-in method and ENABLE 'Email/Password'.");
+          } else {
+            console.error(`❌ Failed to create server user: ${createErr.message}`);
+          }
+          throw createErr;
+        }
+      } else {
+        console.error("❌ Firebase auth error:", e);
+        throw e;
+      }
+    }
+    
+    if (auth.currentUser) {
+      console.log(`✅ Firebase authenticated as: ${auth.currentUser.email} (${auth.currentUser.uid})`);
+      const userDocRef = doc(db, 'users', auth.currentUser.uid);
+      const userDoc = await getDoc(userDocRef);
+      if (!userDoc.exists() || userDoc.data()?.role !== 'admin') {
+        await setDoc(userDocRef, {
+          name: 'Sentinel Server',
+          email: serverEmail,
+          role: 'admin',
+          createdAt: userDoc.exists() ? userDoc.data()?.createdAt : new Date().toISOString()
+        }, { merge: true });
+      }
+      console.log("✅ Firebase authenticated as server admin");
+      
+      // Test connection
+      try {
+        const { getDocFromServer } = await import('firebase/firestore');
+        await getDocFromServer(doc(db, 'test', 'connection'));
+        console.log("✅ Firestore connection verified");
+      } catch (error: any) {
+        if (error.message.includes('the client is offline')) {
+          console.error("❌ Firestore connection failed: Client is offline. Check configuration.");
+        }
+      }
+    }
+  } catch (e) {
+    console.error("Failed to initialize Firebase:", e);
+    throw e;
+  }
 }
 
 import { sendDecisionCardsEmail } from './mailer';
 
 import { rangeFilterPineExact, RFParams } from './range_filter_pine';
 import { mapTfToMs, stripUnclosed, runTfAlignmentUnitTest } from './tf_alignment_guard';
-import * as driftMonitor from './rf_drift_monitor';
+import * as driftMonitor from './rf_drift_monitor.js';
+import { calculateSMC, calculateVSA, calculateRSIDivergence, calculateFibonacci } from './indicators.js';
+import { marketCache } from './cache.js';
+import { getQuickChartBase64 } from './chart_generator.js';
 
 const STRIP_TAGS = /<[^>]*>/g;
 
@@ -210,181 +326,6 @@ function calculateWAE(ohlcv: any[], sensitivity = 150, fastLength = 20, slowLeng
   };
 }
 
-// Smart Money Concepts (SMC) Simplified Calculation
-function calculateSMC(ohlcv: any[]) {
-  if (!Array.isArray(ohlcv) || ohlcv.length < 50) return null; // Need more data for structure
-  
-  const fvgs = { bullish: [] as any[], bearish: [] as any[] };
-  const orderBlocks = { bullish: [] as any[], bearish: [] as any[] };
-  const structure = { 
-    trend: 'NEUTRAL', 
-    lastBreak: null as string | null, // 'BOS_BULL', 'BOS_BEAR', 'CHOCH_BULL', 'CHOCH_BEAR'
-    swingHighs: [] as number[],
-    swingLows: [] as number[]
-  };
-  const liquiditySweeps = { bullish: [] as any[], bearish: [] as any[] };
-  
-  // 1. Calculate Fair Value Gaps (FVG)
-  for (let i = 2; i < ohlcv.length; i++) {
-    const high_prev2 = ohlcv[i-2][2];
-    const low_prev2 = ohlcv[i-2][3];
-    const high_curr = ohlcv[i][2];
-    const low_curr = ohlcv[i][3];
-    
-    if (low_curr > high_prev2) fvgs.bullish.push({ top: low_curr, bottom: high_prev2, index: i });
-    if (high_curr < low_prev2) fvgs.bearish.push({ top: low_prev2, bottom: high_curr, index: i });
-  }
-  fvgs.bullish = fvgs.bullish.slice(-2);
-  fvgs.bearish = fvgs.bearish.slice(-2);
-  
-  // 2. Calculate Swing Points (Fractals)
-  const swings = []; // { type: 'HIGH'|'LOW', price: number, index: number }
-  
-  for (let i = 2; i < ohlcv.length - 2; i++) {
-    const h = ohlcv[i][2];
-    const l = ohlcv[i][3];
-    const isSwingHigh = h > ohlcv[i-1][2] && h > ohlcv[i-2][2] && h > ohlcv[i+1][2] && h > ohlcv[i+2][2];
-    const isSwingLow = l < ohlcv[i-1][3] && l < ohlcv[i-2][3] && l < ohlcv[i+1][3] && l < ohlcv[i+2][3];
-    
-    if (isSwingHigh) {
-      swings.push({ type: 'HIGH', price: h, index: i, open: ohlcv[i][1], close: ohlcv[i][4] });
-      structure.swingHighs.push(h);
-    }
-    if (isSwingLow) {
-      swings.push({ type: 'LOW', price: l, index: i, open: ohlcv[i][1], close: ohlcv[i][4] });
-      structure.swingLows.push(l);
-    }
-  }
-
-  // 3. Identify Order Blocks (Last opposing candle before the move that broke structure)
-  const recentLows = swings.filter(s => s.type === 'LOW').slice(-2);
-  for (const low of recentLows) {
-    orderBlocks.bullish.push({ top: Math.max(low.open, low.close), bottom: low.price });
-  }
-  const recentHighs = swings.filter(s => s.type === 'HIGH').slice(-2);
-  for (const high of recentHighs) {
-    orderBlocks.bearish.push({ top: high.price, bottom: Math.min(high.open, high.close) });
-  }
-
-  // 4. Determine Market Structure (BOS / CHoCH)
-  let currentTrend = 'NEUTRAL';
-  let lastHigh = null;
-  let lastLow = null;
-
-  for (const swing of swings) {
-    if (swing.type === 'HIGH') {
-        if (lastHigh && swing.price > lastHigh.price) {
-            // Higher High
-            if (currentTrend === 'BEARISH') {
-                structure.lastBreak = 'CHOCH_BULL';
-                currentTrend = 'BULLISH';
-            } else {
-                structure.lastBreak = 'BOS_BULL';
-                currentTrend = 'BULLISH';
-            }
-        }
-        lastHigh = swing;
-    } else if (swing.type === 'LOW') {
-        if (lastLow && swing.price < lastLow.price) {
-            // Lower Low
-            if (currentTrend === 'BULLISH') {
-                structure.lastBreak = 'CHOCH_BEAR';
-                currentTrend = 'BEARISH';
-            } else {
-                structure.lastBreak = 'BOS_BEAR';
-                currentTrend = 'BEARISH';
-            }
-        }
-        lastLow = swing;
-    }
-  }
-  structure.trend = currentTrend;
-  
-  // 5. Liquidity Sweeps
-  if (swings.length > 2) {
-    // Check recent bars for sweeps
-    for (let i = ohlcv.length - 5; i < ohlcv.length; i++) {
-        const bar = ohlcv[i];
-        const low = bar[3];
-        const high = bar[2];
-        const close = bar[4];
-        
-        for (const swing of swings) {
-            if (swing.index >= i) continue;
-            if (swing.type === 'LOW' && low < swing.price && close > swing.price) {
-                liquiditySweeps.bullish.push({ price: swing.price, index: i });
-            }
-            if (swing.type === 'HIGH' && high > swing.price && close < swing.price) {
-                liquiditySweeps.bearish.push({ price: swing.price, index: i });
-            }
-        }
-    }
-  }
-
-  // Keep only last 3 swing points for brevity
-  structure.swingHighs = structure.swingHighs.slice(-3);
-  structure.swingLows = structure.swingLows.slice(-3);
-  liquiditySweeps.bullish = liquiditySweeps.bullish.slice(-2);
-  liquiditySweeps.bearish = liquiditySweeps.bearish.slice(-2);
-
-  return { fvgs, orderBlocks, structure, liquiditySweeps };
-}
-
-function calculateVSA(ohlcv: any[]) {
-    if (ohlcv.length < 20) return null;
-    const lastBar = ohlcv[ohlcv.length - 1];
-    const volume = lastBar[5];
-    const avgVolume = ohlcv.slice(-20).reduce((acc, bar) => acc + bar[5], 0) / 20;
-    const spread = lastBar[2] - lastBar[3];
-    const avgSpread = ohlcv.slice(-20).reduce((acc, bar) => acc + (bar[2] - bar[3]), 0) / 20;
-    const closePos = (lastBar[4] - lastBar[3]) / (lastBar[2] - lastBar[3] || 1);
-    
-    let signal = "NEUTRAL";
-    if (volume > avgVolume * 1.5) {
-        if (spread < avgSpread * 0.5) {
-            signal = closePos > 0.5 ? "BULLISH_ABSORPTION" : "BEARISH_ABSORPTION";
-        } else if (spread > avgSpread * 1.5) {
-            signal = closePos > 0.7 ? "BULLISH_EFFORT" : (closePos < 0.3 ? "BEARISH_EFFORT" : "NEUTRAL");
-        }
-    }
-    return { volumeRatio: volume / avgVolume, spreadRatio: spread / avgSpread, signal };
-}
-
-function calculateFibonacci(ohlcv: any[]) {
-    if (ohlcv.length < 50) return null;
-    const highs = ohlcv.slice(-50).map(b => b[2]);
-    const lows = ohlcv.slice(-50).map(b => b[3]);
-    const maxHigh = Math.max(...highs);
-    const minLow = Math.min(...lows);
-    const diff = maxHigh - minLow;
-    return {
-        high: maxHigh,
-        low: minLow,
-        levels: {
-            "0.236": maxHigh - 0.236 * diff,
-            "0.382": maxHigh - 0.382 * diff,
-            "0.5": maxHigh - 0.5 * diff,
-            "0.618": maxHigh - 0.618 * diff,
-            "0.786": maxHigh - 0.786 * diff
-        }
-    };
-}
-
-function calculateRSIDivergence(ohlcv: any[], rsiValues: number[]) {
-    if (ohlcv.length < 30 || rsiValues.length < 30) return "NONE";
-    
-    // Simple divergence check: compare last 2 peaks/troughs
-    const lastPrice = ohlcv[ohlcv.length - 1][4];
-    const prevPrice = ohlcv[ohlcv.length - 10][4];
-    const lastRsi = rsiValues[rsiValues.length - 1];
-    const prevRsi = rsiValues[rsiValues.length - 10];
-    
-    if (lastPrice > prevPrice && lastRsi < prevRsi) return "BEARISH";
-    if (lastPrice < prevPrice && lastRsi > prevRsi) return "BULLISH";
-    
-    return "NONE";
-}
-
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -528,6 +469,7 @@ function getAI() {
 let signals: any[] = [];
 let isBotRunning = false;
 let monitorInterval: NodeJS.Timeout | null = null;
+let latestDecisionCards: any[] = [];
 
 // Helper to send Telegram message
 async function sendTelegramMessage(text: string, reply_markup?: any) {
@@ -698,6 +640,13 @@ async function uploadAnalysisToGCS(analysisData: any, metadata: Record<string, a
     const storage = new Storage(); // gunakan ADC/GOOGLE_APPLICATION_CREDENTIALS
     const bucket = storage.bucket(GCS_BUCKET);
 
+    // Check if bucket exists first to avoid confusing permission errors if it doesn't
+    const [exists] = await bucket.exists().catch(() => [false]);
+    if (!exists) {
+      console.warn(`⚠️ GCS bucket '${GCS_BUCKET}' not found or inaccessible. Skipping upload.`);
+      return null;
+    }
+
     const file = bucket.file(objectName);
 
     await file.save(body, {
@@ -728,6 +677,11 @@ async function uploadAnalysisToGCS(analysisData: any, metadata: Record<string, a
 
 // Helper to fetch market data with technical indicators
 async function fetchMarketDataWithIndicators(symbols: string[]) {
+  const startTime = Date.now();
+  console.log(`[PERF] Starting fetchMarketDataWithIndicators for ${symbols.length} symbols...`);
+  if (symbols.length > 50) {
+    console.warn(`[PERF] WARNING: Fetching indicators for ${symbols.length} symbols might be slow and hit rate limits.`);
+  }
   const marketData: any = {};
   
   // Use Promise.all to fetch data in parallel (limited to 5 concurrent requests to avoid rate limits)
@@ -739,9 +693,16 @@ async function fetchMarketDataWithIndicators(symbols: string[]) {
   for (const chunk of chunks) {
     await Promise.all(chunk.map(async (pair) => {
       try {
+        const cacheKey = `market_data_${pair}`;
+        const cachedData = marketCache.get(cacheKey);
+        if (cachedData) {
+          marketData[pair] = cachedData;
+          return;
+        }
+
         const [ohlcv1d, ohlcv4h, ohlcv1h, ohlcv15m] = await Promise.all([
           binance.fetchOHLCV(pair, '1d', undefined, 100),
-          binance.fetchOHLCV(pair, '4h', undefined, 1000),
+          binance.fetchOHLCV(pair, '4h', undefined, 500),
           binance.fetchOHLCV(pair, '1h', undefined, 200),
           binance.fetchOHLCV(pair, '15m', undefined, 200)
         ]);
@@ -858,11 +819,16 @@ async function fetchMarketDataWithIndicators(symbols: string[]) {
             VSA: vsa15m
           }
         };
+        
+        marketCache.set(cacheKey, marketData[pair]);
       } catch (e) {
         console.error(`Error fetching data for ${pair}:`, e);
       }
     }));
   }
+  
+  const duration = (Date.now() - startTime) / 1000;
+  console.log(`[PERF] fetchMarketDataWithIndicators completed in ${duration.toFixed(2)}s`);
   return marketData;
 }
 
@@ -1259,8 +1225,45 @@ function composeExcelRows(params: {
 }
 // --- END EXCEL ROWS BUILDER ---
 
+// Helper to ensure auth is active
+async function ensureAuth() {
+  if (!auth) return;
+  if (!auth.currentUser) {
+    console.log("⚠️ Auth session lost or not initialized. Re-authenticating...");
+    const serverEmail = 'server@sentinel.local';
+    const serverPassword = process.env.SERVER_PASSWORD || 'sentinel-server-secret-123';
+    try {
+      const userCredential = await signInWithEmailAndPassword(auth, serverEmail, serverPassword);
+      console.log(`✅ Re-authenticated successfully as ${serverEmail}. UID: ${userCredential.user.uid}, Verified: ${userCredential.user.emailVerified}`);
+    } catch (e: any) {
+      if (e.code === 'auth/operation-not-allowed') {
+        console.error("❌ CRITICAL: Email/Password authentication is DISABLED in your Firebase Console.");
+        console.error("👉 ACTION REQUIRED: Go to Firebase Console > Authentication > Sign-in method and ENABLE 'Email/Password'.");
+      } else if (e.code === 'auth/user-not-found' || e.code === 'auth/invalid-credential') {
+        console.log(`ℹ️ Server user ${serverEmail} not found or invalid. Attempting to create...`);
+        try {
+          const userCredential = await createUserWithEmailAndPassword(auth, serverEmail, serverPassword);
+          console.log(`✅ Server user created successfully. UID: ${userCredential.user.uid}`);
+        } catch (createErr: any) {
+          if (createErr.code === 'auth/operation-not-allowed') {
+            console.error("❌ CRITICAL: Email/Password authentication is DISABLED in your Firebase Console.");
+            console.error("👉 ACTION REQUIRED: Go to Firebase Console > Authentication > Sign-in method and ENABLE 'Email/Password'.");
+          } else {
+            console.error("❌ Failed to create server user:", createErr.message);
+          }
+        }
+      } else {
+        console.error("❌ Re-authentication failed:", e.message);
+      }
+    }
+  }
+}
+
 // Core monitoring function
 async function monitorMarkets() {
+  await ensureAuth();
+  const startTime = Date.now();
+  console.log(`[PERF] Starting monitorMarkets run at ${new Date().toISOString()}`);
   try {
     console.log('Fetching market data and positions...');
     
@@ -1727,8 +1730,30 @@ async function monitorMarkets() {
       - Untuk tombol (buttons.show), label WAJIB menyertakan nama pair agar jelas (contoh: "RL BTC", "HOLD ETH").
     `;
 
+    // Generate Visual Chart for the most relevant coin
+    let chartBase64 = null;
+    let chartSymbol = positions.length > 0 ? positions[0].symbol : top20Symbols[0];
+    let finalPrompt = prompt;
+    
+    if (chartSymbol) {
+      try {
+        const ohlcv4h = await binance.fetchOHLCV(chartSymbol, '4h', undefined, 60);
+        chartBase64 = await getQuickChartBase64(chartSymbol, ohlcv4h, '4H');
+        if (chartBase64) {
+          console.log(`[CHART] Generated visual chart for ${chartSymbol}`);
+          finalPrompt += `
+      VISUAL ANALYSIS:
+      - Jika ada gambar chart yang dilampirkan, itu adalah chart untuk pair ${chartSymbol}.
+      - Analisa gambar tersebut secara visual (candlestick pattern, support/resistance kasat mata) dan jadikan pertimbangan tambahan dalam mengambil keputusan untuk pair tersebut.
+          `;
+        }
+      } catch (e) {
+        console.error(`[CHART] Failed to fetch OHLCV for chart generation:`, e);
+      }
+    }
+
     // Switched to gemini-3-flash-preview for better stability, with Search enabled
-    const analysisJson = await generateWithRetry(prompt, 'gemini-3-flash-preview', 3, true, null, true);
+    const analysisJson = await generateWithRetry(finalPrompt, 'gemini-3-flash-preview', 3, true, chartBase64, true);
     
     if (!analysisJson) {
       throw new Error('Failed to generate analysis');
@@ -1742,7 +1767,18 @@ async function monitorMarkets() {
         
         if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
             const cleanJson = analysisJson.substring(firstBrace, lastBrace + 1);
-            analysisData = JSON.parse(cleanJson);
+            try {
+                analysisData = JSON.parse(cleanJson);
+            } catch (parseErr: any) {
+                // If it fails with "Unexpected non-whitespace character after JSON at position X"
+                const match = parseErr.message.match(/at position (\d+)/);
+                if (match) {
+                    const pos = parseInt(match[1], 10);
+                    analysisData = JSON.parse(cleanJson.substring(0, pos));
+                } else {
+                    throw parseErr;
+                }
+            }
         } else {
             throw new Error("Could not find valid JSON object in response");
         }
@@ -1756,6 +1792,7 @@ async function monitorMarkets() {
     }
     
     const cards = analysisData.decision_cards || [];
+    latestDecisionCards = cards;
     const se = analysisData.server_enforce || { overrides:[], mr_projection:[], alerts:[] };
     const gg = analysisData.global_guard || { mode:"NORMAL" };
     const new_signals = analysisData.new_signals || null;
@@ -1795,26 +1832,32 @@ async function monitorMarkets() {
     // --- NEW: Save to Trading Journal ---
     if (db && new_signals && new_signals.signals && new_signals.signals.length > 0) {
       try {
+        await ensureAuth();
         for (const sig of new_signals.signals) {
           const journalEntry = {
             id: `journal_${Date.now()}_${sig.symbol.replace('/', '')}`,
             timestamp: new Date().toISOString(),
-            symbol: sig.symbol,
-            side: sig.side,
-            entry_price: sig.entry,
-            stop_loss: sig.stop_loss,
-            target_1: sig.targets?.t1,
-            target_2: sig.targets?.t2,
+            symbol: sig.symbol || 'UNKNOWN',
+            side: sig.side || 'UNKNOWN',
+            entryPrice: isFinite(typeof sig.entry === 'string' ? parseFloat(sig.entry) : sig.entry) ? (typeof sig.entry === 'string' ? parseFloat(sig.entry) : sig.entry) : 0,
+            stopLoss: isFinite(typeof sig.stop_loss === 'string' ? parseFloat(sig.stop_loss) : sig.stop_loss) ? (typeof sig.stop_loss === 'string' ? parseFloat(sig.stop_loss) : sig.stop_loss) : 0,
+            target1: isFinite(typeof sig.targets?.t1 === 'string' ? parseFloat(sig.targets.t1) : sig.targets?.t1) ? (typeof sig.targets?.t1 === 'string' ? parseFloat(sig.targets.t1) : sig.targets?.t1) : 0,
+            target2: isFinite(typeof sig.targets?.t2 === 'string' ? parseFloat(sig.targets.t2) : sig.targets?.t2) ? (typeof sig.targets?.t2 === 'string' ? parseFloat(sig.targets.t2) : sig.targets?.t2) : 0,
             reason: sig.why_this_pair || '',
             sentiment: sig.sentiment?.status || 'NEUTRAL',
             status: 'OPEN', // OPEN, WIN, LOSS, CLOSED
+            source: 'AI',
             pnl: 0
           };
-          await db.collection('trading_journal').doc(journalEntry.id).set(journalEntry);
+          try {
+            await setDoc(doc(db, 'trading_journal', journalEntry.id), journalEntry);
+          } catch (err: any) {
+            handleFirestoreError(err, OperationType.WRITE, `trading_journal/${journalEntry.id}`);
+          }
         }
         console.log(`✅ Saved ${new_signals.signals.length} signals to Trading Journal.`);
       } catch (err: any) {
-        console.error("Failed to save to Trading Journal:", err.message);
+        handleFirestoreError(err, OperationType.WRITE, 'trading_journal_batch');
       }
     }
     // --- END NEW ---
@@ -1835,15 +1878,18 @@ async function monitorMarkets() {
         
         if (db) {
           try {
-            await db.collection('signals').doc(newSignal.id).set(newSignal);
+            await ensureAuth();
+            await setDoc(doc(db, 'signals', newSignal.id), newSignal);
           } catch (dbErr) {
-            console.error("Failed to save signal to Firestore:", dbErr);
+            handleFirestoreError(dbErr, OperationType.WRITE, `signals/${newSignal.id}`);
           }
         }
     }
     
     if (signals.length > 50) signals.splice(50);
 
+    const duration = (Date.now() - startTime) / 1000;
+    console.log(`[PERF] monitorMarkets total duration: ${duration.toFixed(2)}s`);
   } catch (error) {
     console.error('Error in monitorMarkets:', error);
     throw error;
@@ -2063,19 +2109,38 @@ function renderDecisionCardsToTelegram(cards: any[], server_enforce: any, global
                 let p = 100;
                 let tp = '';
                 
-                if (card.action_now) {
-                    const actionMap: Record<string, string> = {
-                        'RL': 'REDUCE_LONG', 'RS': 'REDUCE_SHORT', 'AL': 'ADD_LONG', 'AS': 'ADD_SHORT',
-                        'LN': 'LOCK_NEUTRAL', 'HO': 'HEDGE_ON', 'UL': 'UNLOCK', 'RR': 'ROLE', 'TP': 'TAKE_PROFIT', 'HOLD': 'HOLD'
-                    };
-                    if (actionMap[a] === card.action_now.action) {
-                        p = card.action_now.percentage || 100;
-                        tp = (card.action_now.target_price && card.action_now.target_price !== 'Market') ? card.action_now.target_price.toString() : '';
+                const actionMap: Record<string, string> = {
+                    'RL': 'REDUCE_LONG', 'RS': 'REDUCE_SHORT', 'AL': 'ADD_LONG', 'AS': 'ADD_SHORT',
+                    'LN': 'LOCK_NEUTRAL', 'HO': 'HEDGE_ON', 'UL': 'UNLOCK', 'RR': 'ROLE', 'TP': 'TAKE_PROFIT', 'HOLD': 'HOLD'
+                };
+                const fullAction = actionMap[a] || a;
+
+                if (card.action_now && fullAction === card.action_now.action) {
+                    p = card.action_now.percentage || 100;
+                    tp = (card.action_now.target_price && card.action_now.target_price !== 'Market') ? card.action_now.target_price.toString() : '';
+                }
+                
+                // If tp is still empty, try to extract from if_then
+                if (!tp && card.if_then) {
+                    if (card.if_then.if_price_up_to && card.if_then.if_price_up_to.length > 0) {
+                        const up = card.if_then.if_price_up_to[0];
+                        if (up.do === fullAction) tp = up.level.toString();
+                    }
+                    if (!tp && card.if_then.if_price_down_to && card.if_then.if_price_down_to.length > 0) {
+                        const down = card.if_then.if_price_down_to[0];
+                        if (down.do === fullAction) tp = down.level.toString();
                     }
                 }
                 
-                const sh = stopLock !== null && stopLock !== undefined ? stopLock.toString() : '';
+                // Only attach stopHedgePrice to opening/locking actions
+                const openingActions = ['AL', 'AS', 'LN', 'HO', 'RR'];
+                const sh = (openingActions.includes(a) && stopLock !== null && stopLock !== undefined) ? stopLock.toString() : '';
                 
+                // User request: "semua harus berdasarkan STOP-LIMIT ataupun STOP_MARKET, Decision Card harus menyertakan harga target untuk eksekusi bila tidak jangan buat tombol action di telegram"
+                if (a !== 'HOLD' && !tp && !sh) {
+                    continue; // Skip rendering this button if no target price or stop price
+                }
+
                 const callback_data = buildCallbackData({
                     action: a,
                     symbol: s,
@@ -2287,10 +2352,74 @@ app.get('/api/journal', async (req, res) => {
     return res.status(500).json({ error: 'Firestore not initialized' });
   }
   try {
-    const snapshot = await db.collection('trading_journal').orderBy('timestamp', 'desc').limit(100).get();
+    const q = query(collection(db, 'trading_journal'), orderBy('timestamp', 'desc'), limit(100));
+    const snapshot = await getDocs(q);
     const journal = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     res.json({ journal });
   } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/journal/sync', async (req, res) => {
+  if (!db) {
+    return res.status(500).json({ error: 'Firestore not initialized' });
+  }
+  try {
+    // 1. Get symbols from recent income
+    const income = await binance.fapiPrivateGetIncome({ incomeType: 'REALIZED_PNL', limit: 100 });
+    const rawSymbols = [...new Set(income.map((i: any) => i.symbol))];
+    
+    // Convert raw symbols like BTCUSDT to CCXT format BTC/USDT:USDT
+    const markets = await binance.loadMarkets();
+    const symbols = rawSymbols.map(rs => {
+      const market = Object.values(markets).find(m => m.id === rs);
+      return market ? market.symbol : null;
+    }).filter(s => s);
+
+    let syncedCount = 0;
+    
+    // 2. Fetch trades for each symbol
+    for (const symbol of symbols) {
+      if (!symbol) continue;
+      await ensureAuth();
+      const trades = await binance.fetchMyTrades(symbol, undefined, 50);
+      
+      for (const trade of trades) {
+        // Only sync closed trades (where realized PNL is present)
+        const pnlRaw = parseFloat(trade.info?.realizedPnl || '0');
+        const pnl = isNaN(pnlRaw) ? 0 : pnlRaw;
+        if (pnl !== 0) {
+          const entryPriceRaw = (typeof trade.price === 'string' ? parseFloat(trade.price) : trade.price) || 0;
+          const entryPrice = isFinite(entryPriceRaw) ? entryPriceRaw : 0;
+          
+          const journalEntry = {
+            id: `journal_${trade.id}_${symbol.replace('/', '')}`,
+            timestamp: new Date(trade.timestamp).toISOString(),
+            symbol: symbol,
+            side: trade.side ? trade.side.toUpperCase() : 'UNKNOWN',
+            entryPrice: entryPrice,
+            exitPrice: entryPrice, // For a closing trade, the price is the exit price
+            pnl: pnl,
+            reason: 'Synced from Binance History',
+            sentiment: 'NEUTRAL',
+            status: 'CLOSED',
+            source: 'USER',
+          };
+          
+          try {
+            await setDoc(doc(db, 'trading_journal', journalEntry.id), journalEntry, { merge: true });
+            syncedCount++;
+          } catch (dbErr) {
+            handleFirestoreError(dbErr, OperationType.WRITE, `trading_journal/${journalEntry.id}`);
+          }
+        }
+      }
+    }
+    
+    res.json({ success: true, syncedCount });
+  } catch (error: any) {
+    console.error('Error syncing journal:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -2305,7 +2434,7 @@ app.post('/api/bot/toggle', async (req, res) => {
       await monitorMarkets();
       monitorInterval = setInterval(() => {
         monitorMarkets().catch(console.error);
-      }, 3600000);
+      }, 900000); // 15 minutes
       isBotRunning = true;
       res.json({ isBotRunning });
     } catch (error: any) {
@@ -2447,8 +2576,8 @@ async function generateAiReply(userMessage: string, chatId: string = 'default', 
   let chatHistory: { role: string, content: string }[] = [];
   if (db) {
     try {
-      const chatDoc = await db.collection('telegram_chats').doc(chatId.toString()).get();
-      if (chatDoc.exists) {
+      const chatDoc = await getDoc(doc(db, 'telegram_chats', chatId.toString()));
+      if (chatDoc.exists()) {
         chatHistory = chatDoc.data()?.history || [];
       }
     } catch (err) {
@@ -2640,7 +2769,8 @@ async function generateAiReply(userMessage: string, chatId: string = 'default', 
     
     if (db) {
       try {
-        await db.collection('telegram_chats').doc(chatId.toString()).set({
+        await ensureAuth();
+        await setDoc(doc(db, 'telegram_chats', chatId.toString()), {
           history: chatHistory,
           updatedAt: new Date()
         }, { merge: true });
@@ -2696,6 +2826,13 @@ app.get('/api/market', async (req, res) => {
 
 // Vite middleware for development
 async function startServer() {
+  // Initialize Firebase FIRST
+  try {
+    await initFirebase();
+  } catch (err) {
+    console.error("CRITICAL: Firebase initialization failed. Server will start but database features may fail.");
+  }
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -2806,6 +2943,11 @@ async function startServer() {
     
     if (!action || !symbol) {
         return `❌ Unsupported action after normalization: ${rawAction} ${rawSymbol}`;
+    }
+
+    // User request: "semua harus berdasarkan STOP-LIMIT ataupun STOP_MARKET, Decision Card harus menyertakan harga target untuk eksekusi bila tidak jangan buat tombol action di telegram, lakukan hal yang sama di menu command telegram"
+    if (action !== 'HOLD' && !targetPrice && !stopHedgePrice) {
+        return `❌ Aksi ${action} ditolak: Eksekusi instan (MARKET) dinonaktifkan. Harap sertakan harga target (targetPrice) atau harga stop (stopHedgePrice) untuk mengeksekusi sebagai STOP-LIMIT atau STOP_MARKET.`;
     }
 
     const activeClient = VALIDATION_MODE === "DEMO_TRADING" ? binanceDemo : binance;
@@ -3095,6 +3237,14 @@ async function startServer() {
         }
       }
 
+      // Determine the primary price for the main order based on the action
+      let primaryPrice: number | undefined;
+      if (action === 'LOCK_NEUTRAL' || action === 'LN') {
+        primaryPrice = stopHedgePrice || targetPrice;
+      } else {
+        primaryPrice = targetPrice || stopHedgePrice;
+      }
+
       // 6) HELPERS FOR ORDER PLACEMENT
       const buildParams = (useHedgeMode: boolean, determinedOrderType: string) => {
         const params: any = {};
@@ -3106,10 +3256,8 @@ async function startServer() {
           }
         }
 
-        if (stopHedgePrice) {
-          params.stopPrice = stopHedgePrice;
-        } else if (targetPrice && (determinedOrderType.includes('STOP') || determinedOrderType.includes('TAKE_PROFIT'))) {
-          params.stopPrice = targetPrice;
+        if (determinedOrderType.includes('STOP') || determinedOrderType.includes('TAKE_PROFIT')) {
+          params.stopPrice = primaryPrice;
         }
 
         return params;
@@ -3117,20 +3265,18 @@ async function startServer() {
 
       const determineOrderType = () => {
         let orderType = 'MARKET';
-        if (stopHedgePrice) {
-          orderType = targetPrice ? 'STOP' : 'STOP_MARKET';
-        } else if (targetPrice) {
-          if (isReducing || action === 'TP') {
+        if (primaryPrice) {
+          if (isReducing || action === 'TP' || action === 'LN' || action === 'UNLOCK') {
             if (side === 'sell') {
-              orderType = targetPrice > currentPrice ? 'TAKE_PROFIT_MARKET' : 'STOP_MARKET';
+              orderType = primaryPrice > currentPrice ? 'TAKE_PROFIT_MARKET' : 'STOP_MARKET';
             } else {
-              orderType = targetPrice < currentPrice ? 'TAKE_PROFIT_MARKET' : 'STOP_MARKET';
+              orderType = primaryPrice < currentPrice ? 'TAKE_PROFIT_MARKET' : 'STOP_MARKET';
             }
           } else {
             if (side === 'buy') {
-              orderType = targetPrice < currentPrice ? 'LIMIT' : 'STOP_MARKET';
+              orderType = primaryPrice < currentPrice ? 'LIMIT' : 'STOP_MARKET';
             } else {
-              orderType = targetPrice > currentPrice ? 'LIMIT' : 'STOP_MARKET';
+              orderType = primaryPrice > currentPrice ? 'LIMIT' : 'STOP_MARKET';
             }
           }
         }
@@ -3516,7 +3662,7 @@ async function pollTelegram() {
                     callback_query_id: callback.id,
                     text: `❌ Error: Invalid action or symbol in callback data`,
                     show_alert: true
-                });
+                }).catch(() => {});
                 continue;
             }
             
@@ -3524,6 +3670,8 @@ async function pollTelegram() {
             await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
                 callback_query_id: callback.id,
                 text: `Processing ${parsed.action} on ${parsed.symbol}...`
+            }).catch((err) => {
+                console.warn("[TG ACK ERROR]", err.message);
             });
 
             // Execute Trade with Target Price and Stop Hedge
@@ -3884,26 +4032,12 @@ async function generateAutoJournal() {
 
       Buatlah evaluasi singkat (maksimal 3 paragraf pendek) yang berisi:
       1. Ringkasan performa (apakah bagus, buruk, atau biasa saja).
-      2. Insight/Pelajaran yang bisa diambil dari angka-angka tersebut (misal: jika win rate rendah tapi profit, berarti risk/reward bagus. Jika loss besar, ingatkan soal cut loss).
-      3. Pesan motivasi atau peringatan psikologis untuk sesi trading 12 jam berikutnya.
-
-      Gunakan bahasa Indonesia yang profesional, tegas, namun memotivasi ala mentor trading elit. Jangan gunakan format markdown tebal (**) berlebihan, gunakan secukupnya.
+      2. Insight/Pelajaran yang bisa diambil dari angka-angka tersebut (misal: jika win rate kecil tapi net pnl positif, berarti risk:reward bagus).
+      3. Saran untuk sesi trading berikutnya.
+      Gunakan bahasa Indonesia yang profesional namun santai.
     `;
 
     const evaluation = await generateWithRetry(prompt, 'gemini-3-flash-preview');
-    
-    const journalData = {
-      timestamp: new Date().toISOString(),
-      period: "12h",
-      totalTrades,
-      winRate: parseFloat(winRate),
-      netPnl,
-      tradedSymbols: Array.from(tradedSymbols),
-      evaluation
-    };
-
-    // Save to Firestore
-    await db.collection('journal_summaries').add(journalData);
 
     // Send to Telegram
     const tgMsg = `📝 <b>Jurnal Trading Sentinel (12 Jam Terakhir)</b>\n\n` +
@@ -3927,12 +4061,19 @@ async function generateAutoJournal() {
 }
 
 // Schedule Auto-Journaling at 07:30 and 19:30 WIB (Asia/Jakarta)
-cron.schedule('30 7,19 * * *', generateAutoJournal, {
-  timezone: "Asia/Jakarta"
-});
+function scheduleCronJobs() {
+  cron.schedule('30 7,19 * * *', generateAutoJournal, {
+    timezone: "Asia/Jakarta"
+  });
+
+  // Schedule Risk Manager every 10 minutes
+  cron.schedule('*/10 * * * *', checkRiskAndNotify);
+  console.log("✅ Cron jobs scheduled");
+}
 
 // --- PROACTIVE RISK MANAGER ---
 let lastRiskAlerts: Record<string, number> = {}; // symbol -> timestamp
+let lastMarginAlert = 0;
 
 async function checkRiskAndNotify() {
   if (!BINANCE_API_KEY || !BINANCE_API_SECRET || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
@@ -3948,51 +4089,128 @@ async function checkRiskAndNotify() {
     if (!riskData) return;
 
     const now = Date.now();
-    const ALERT_COOLDOWN = 60 * 60 * 1000; // 1 hour cooldown per symbol
+    const ALERT_COOLDOWN = 12 * 60 * 60 * 1000; // 12 hours cooldown per symbol
+    const MARGIN_COOLDOWN = 1 * 60 * 60 * 1000; // 1 hour for margin alerts
 
     let alertTriggered = false;
     let alertReason = "";
 
     // Check 1: Margin Ratio Danger
     if (riskData.marginRatio > 80) {
-      alertTriggered = true;
-      alertReason += `⚠️ <b>BAHAYA LIKUIDASI!</b> Margin Ratio mencapai ${riskData.marginRatio.toFixed(2)}%. Segera tambah margin atau kurangi posisi.\n`;
-    }
-
-    // Check 2: High Floating Loss or High Profit
-    for (const pos of openPositions) {
-      const pnl = pos.unrealizedPnl || 0;
-      const initialMargin = pos.initialMargin || (pos.notional / (pos.leverage || 1));
-      const roe = initialMargin > 0 ? (pnl / initialMargin) * 100 : 0;
-
-      const lastAlert = lastRiskAlerts[pos.symbol] || 0;
-      if (now - lastAlert < ALERT_COOLDOWN) continue; // Skip if recently alerted
-
-      if (roe < -20) {
+      if (now - lastMarginAlert > MARGIN_COOLDOWN) {
         alertTriggered = true;
-        alertReason += `🚨 <b>DRAWDOWN WARNING:</b> Posisi ${pos.side} ${pos.symbol} sedang floating minus <b>${roe.toFixed(2)}%</b> ($${pnl.toFixed(2)}). Waktunya evaluasi Cut Loss atau Hedging!\n`;
-        lastRiskAlerts[pos.symbol] = now;
-      } else if (roe > 50) {
-        alertTriggered = true;
-        alertReason += `💰 <b>PROFIT SECURE:</b> Posisi ${pos.side} ${pos.symbol} sudah profit <b>+${roe.toFixed(2)}%</b> ($${pnl.toFixed(2)}). Pertimbangkan untuk Take Profit parsial atau pasang Trailing Stop.\n`;
-        lastRiskAlerts[pos.symbol] = now;
+        alertReason += `⚠️ <b>BAHAYA LIKUIDASI!</b> Margin Ratio mencapai ${riskData.marginRatio.toFixed(2)}%. Evaluasi segera ketahanan margin.\n`;
+        lastMarginAlert = now;
       }
     }
 
+    // Check 2: If/Then Proximity
+    let hasPositionAlerts = false;
+    
+    // Create a map of current prices from open positions
+    const currentPrices: Record<string, number> = {};
+    for (const pos of openPositions) {
+      if (pos.markPrice) {
+        currentPrices[pos.symbol] = pos.markPrice;
+      }
+    }
+
+    if (latestDecisionCards && latestDecisionCards.length > 0) {
+      for (const card of latestDecisionCards) {
+        const symbol = card.symbol;
+        const currentPrice = currentPrices[symbol];
+        
+        if (!currentPrice) continue; // Skip if we don't have the current price
+        
+        const lastAlert = lastRiskAlerts[symbol] || 0;
+        if (now - lastAlert < ALERT_COOLDOWN) continue; // Skip if recently alerted
+
+        if (card.if_then && Array.isArray(card.if_then)) {
+          for (const scenario of card.if_then) {
+            // Extract the first floating point number from the scenario string
+            // Example: "Up to 76.5: HOLD..." -> 76.5
+            const match = scenario.match(/(?:Up to|Down to|to|target)\s*([\d.]+)/i) || scenario.match(/^.*?([\d.]+).*?:/);
+            
+            if (match && match[1]) {
+              const targetPrice = parseFloat(match[1]);
+              if (!isNaN(targetPrice) && targetPrice > 0) {
+                const distancePct = Math.abs(currentPrice - targetPrice) / targetPrice;
+                
+                // If price is within 1% of the target
+                if (distancePct <= 0.01) {
+                  hasPositionAlerts = true;
+                  alertReason += `🎯 <b>IF/THEN PROXIMITY:</b> Harga ${symbol} saat ini (${currentPrice}) mendekati target skenario: <i>"${scenario}"</i>.\n`;
+                  lastRiskAlerts[symbol] = now;
+                  break; // Alert once per symbol to avoid spam
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (hasPositionAlerts) {
+      alertTriggered = true;
+    }
+
     if (alertTriggered) {
+      // Fetch recent chat context
+      let recentContext = "";
+      if (db) {
+        try {
+          const chatDoc = await getDoc(doc(db, 'telegram_chats', TELEGRAM_CHAT_ID.toString()));
+          if (chatDoc.exists()) {
+            const history = chatDoc.data()?.history || [];
+            if (history.length > 0) {
+              recentContext = "Konteks Chat Terakhir dengan Pengguna:\n";
+              // Get last 4 messages
+              const recentHistory = history.slice(-4);
+              recentHistory.forEach((msg: any) => {
+                recentContext += `- ${msg.role === 'user' ? 'User' : 'Sentinel'}: ${msg.content}\n`;
+              });
+            }
+          }
+        } catch (err) {
+          console.error("Error reading chat history for risk manager:", err);
+        }
+      }
+
+      let decisionCardsContext = "";
+      if (latestDecisionCards && latestDecisionCards.length > 0) {
+        decisionCardsContext = "Konteks Decision Cards Terakhir (Analisis Pasar Sentinel):\n" + 
+          JSON.stringify(latestDecisionCards.map(c => ({
+            symbol: c.symbol,
+            action: c.primary_action,
+            status: c.status,
+            reason: c.reasoning
+          })), null, 2);
+      }
+
       const prompt = `
         Anda adalah "Crypto Sentinel V2 - Risk Manager".
         Sistem mendeteksi kondisi berikut pada akun pengguna:
         ${alertReason}
 
-        Buatlah pesan teguran/peringatan singkat (maksimal 2 paragraf) untuk dikirim ke Telegram pengguna.
-        Gunakan gaya bahasa mentor trading yang tegas, proaktif, dan mengingatkan soal psikologi trading (jangan serakah, jangan takut cut loss).
+        ${recentContext}
+
+        ${decisionCardsContext}
+
+        PENTING: Pengguna saat ini menggunakan strategi "Hedging Recovery". 
+        Artinya, floating minus yang sangat besar (bahkan ribuan persen) pada beberapa posisi mungkin disengaja sebagai bagian dari kuncian (hedging) untuk menjaga margin, BUKAN karena pengguna lupa cut loss.
+        
+        Tugas Anda:
+        Buatlah pesan evaluasi singkat (maksimal 2 paragraf) untuk dikirim ke Telegram pengguna.
+        Fokus utama Anda adalah memberikan saran tindakan berdasarkan skenario "If/Then" yang sudah mendekati target harga saat ini.
+        Gunakan nada analitis, objektif, dan suportif sebagai asisten pengelola risiko (Risk Manager) yang memahami strategi Hedging Recovery.
+        JANGAN berteriak panik menyuruh "Cut Loss" membabi buta.
+        Jika ada peringatan Margin Ratio > 80%, ingatkan juga tentang pengelolaan margin.
         Format dalam PLAIN TEXT dengan emoji secukupnya.
       `;
 
       const aiMessage = await generateWithRetry(prompt, 'gemini-3-flash-preview');
       
-      const tgMsg = `🛡️ <b>SENTINEL PROACTIVE ALERT</b> 🛡️\n\n${alertReason}\n🧠 <b>Saran Mentor:</b>\n${aiMessage}`;
+      const tgMsg = `🛡️ <b>SENTINEL PROACTIVE ALERT</b> 🛡️\n\n${alertReason}\n🧠 <b>Analisis Risk Manager:</b>\n${aiMessage}`;
       
       await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
         chat_id: TELEGRAM_CHAT_ID,
@@ -4007,7 +4225,7 @@ async function checkRiskAndNotify() {
 }
 
 // Schedule Risk Manager every 10 minutes
-// cron.schedule('*/10 * * * *', checkRiskAndNotify);
+// Moved to scheduleCronJobs()
 
 app.listen(PORT, '0.0.0.0', async () => {
     console.log(`Server running on http://localhost:${PORT}`);
@@ -4043,6 +4261,7 @@ app.listen(PORT, '0.0.0.0', async () => {
     }
     
     pollTelegram();
+    scheduleCronJobs();
   }).on('error', (err: any) => {
     console.error('Server error:', err);
     process.exit(1);

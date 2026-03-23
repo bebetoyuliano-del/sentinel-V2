@@ -2831,6 +2831,14 @@ async function runBacktest(
 
     return {
       symbol, timeframe, days,
+      settings: {
+        takeProfitPct,
+        lock11Mode,
+        lockTriggerPct,
+        add05Mode,
+        structure21Mode,
+        maxMrPct
+      },
       summary: {
         initialBalance,
         finalBalance: balance,
@@ -2875,6 +2883,14 @@ app.post('/api/ai/optimize', async (req, res) => {
       - Symbol: ${backtestResult.symbol}
       - Timeframe: ${backtestResult.timeframe}
       - Days: ${backtestResult.days}
+      
+      Settings Used for this Backtest:
+      - Take Profit: ${backtestResult.settings?.takeProfitPct || 4.0}%
+      - Lock 1:1 Mode: ${backtestResult.settings?.lock11Mode ? 'Enabled' : 'Disabled'}
+      - Lock Trigger: ${backtestResult.settings?.lockTriggerPct || 2.0}%
+      - Add 0.5 Mode: ${backtestResult.settings?.add05Mode ? 'Enabled' : 'Disabled'}
+      - Structure 2:1 Mode: ${backtestResult.settings?.structure21Mode ? 'Enabled' : 'Disabled'}
+      - Max MR (Margin Ratio): ${backtestResult.settings?.maxMrPct || 25.0}%
       
       Performance Summary:
       - Initial Balance: $${backtestResult.summary.initialBalance.toFixed(2)}
@@ -2937,6 +2953,7 @@ app.post('/api/backtest', async (req, res) => {
         symbol: result.symbol,
         timeframe: result.timeframe,
         days: result.days,
+        settings: result.settings,
         summary: result.summary
       }, { merge: true });
     } catch (e) {

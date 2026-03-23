@@ -9,6 +9,14 @@ interface BacktestResult {
   symbol: string;
   timeframe: string;
   days: number;
+  settings?: {
+    takeProfitPct: number;
+    lock11Mode: boolean;
+    lockTriggerPct: number;
+    add05Mode: boolean;
+    structure21Mode: boolean;
+    maxMrPct: number;
+  };
   summary: {
     initialBalance: number;
     finalBalance: number;
@@ -112,15 +120,15 @@ const BacktestView: React.FC = () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
-          symbol, 
-          timeframe, 
-          days, 
-          takeProfitPct, 
-          lock11Mode, 
-          lockTriggerPct,
-          add05Mode,
-          structure21Mode,
-          maxMrPct,
+          symbol: result.symbol, 
+          timeframe: result.timeframe, 
+          days: result.days, 
+          takeProfitPct: result.settings?.takeProfitPct || takeProfitPct, 
+          lock11Mode: result.settings?.lock11Mode ?? lock11Mode, 
+          lockTriggerPct: result.settings?.lockTriggerPct || lockTriggerPct,
+          add05Mode: result.settings?.add05Mode ?? add05Mode,
+          structure21Mode: result.settings?.structure21Mode ?? structure21Mode,
+          maxMrPct: result.settings?.maxMrPct || maxMrPct,
           summary: result.summary
         })
       });

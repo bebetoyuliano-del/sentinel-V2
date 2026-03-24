@@ -1279,9 +1279,9 @@ async function monitorMarkets(force = false) {
         const lockSnap = await getDoc(lockRef);
         if (lockSnap.exists()) {
           const lastRun = lockSnap.data().last_run_time || 0;
-          // If last run was less than 14 minutes ago, skip to prevent multiple instances from spamming
-          if (Date.now() - lastRun < 14 * 60 * 1000) {
-            console.log(`[LOCK] Skipping monitorMarkets, last run was less than 14 minutes ago.`);
+          // If last run was less than 59 minutes ago, skip to prevent multiple instances from spamming
+          if (Date.now() - lastRun < 59 * 60 * 1000) {
+            console.log(`[LOCK] Skipping monitorMarkets, last run was less than 59 minutes ago.`);
             return;
           }
         }
@@ -2613,11 +2613,45 @@ async function runPaperTradingEngine() {
           }
           await deleteDoc(doc(db, 'paper_positions', pos.id));
           wallet.balance += pos.currentPnl;
-          wallet.equity = wallet.balance;
-          wallet.freeMargin = wallet.balance;
+          
+          // Recalculate equity
+          let remainingUnrealized = 0;
+          if (longPos && longPos.id !== pos.id) remainingUnrealized += longPos.currentPnl;
+          if (shortPos && shortPos.id !== pos.id) remainingUnrealized += shortPos.currentPnl;
+          wallet.equity = wallet.balance + remainingUnrealized;
+          
+          wallet.freeMargin += (pos.size * pos.entryPrice) + pos.currentPnl;
           wallet.updatedAt = new Date().toISOString();
           await setDoc(walletRef, wallet);
           await sendTelegramMessage(`[PAPER] 💰 <b>Closed ${pos.side} ${symbol}</b>\nReason: ${reason}\nPnL: $${pos.currentPnl.toFixed(2)}`);
+        };
+
+        // Helper to partially close position
+        const partialClosePos = async (pos: any, sizeToClose: number, reason: string) => {
+          const proportion = sizeToClose / pos.size;
+          const realizedPnl = pos.currentPnl * proportion;
+          
+          const historyId = `${pos.id}_partial_${Date.now()}`;
+          await setDoc(doc(db, 'paper_history', historyId), {
+            ...pos, size: sizeToClose, exitPrice: currentPrice, pnl: realizedPnl, reason, closedAt: new Date().toISOString(), status: 'CLOSED'
+          });
+          
+          pos.size -= sizeToClose;
+          pos.currentPnl -= realizedPnl;
+          await setDoc(doc(db, 'paper_positions', pos.id), { size: pos.size, unrealizedPnl: pos.currentPnl }, { merge: true });
+          
+          wallet.balance += realizedPnl;
+          
+          // Recalculate equity
+          let remainingUnrealized = 0;
+          if (longPos) remainingUnrealized += longPos.currentPnl;
+          if (shortPos) remainingUnrealized += shortPos.currentPnl;
+          wallet.equity = wallet.balance + remainingUnrealized;
+          
+          wallet.freeMargin += (sizeToClose * pos.entryPrice) + realizedPnl;
+          wallet.updatedAt = new Date().toISOString();
+          await setDoc(walletRef, wallet);
+          await sendTelegramMessage(`[PAPER] 💰 <b>Partial Close ${pos.side} ${symbol}</b>\nReason: ${reason}\nPnL: $${realizedPnl.toFixed(2)}`);
         };
 
         // Helper to open position
@@ -2634,7 +2668,8 @@ async function runPaperTradingEngine() {
             id: newPosRef.id, symbol, side, entryPrice: currentPrice, size, unrealizedPnl: 0,
             takeProfit: side === 'LONG' ? currentPrice * (1 + takeProfitPct/100) : currentPrice * (1 - takeProfitPct/100),
             stopLoss: 0, status: 'OPEN', openedAt: new Date().toISOString(), signalId, journalId,
-            isHedge: reason.includes('Lock') || reason.includes('Hedge')
+            isHedge: reason.includes('Lock') || reason.includes('Hedge'),
+            realizedHedgeProfit: 0
           };
           await setDoc(newPosRef, newPos);
           
@@ -2666,31 +2701,36 @@ async function runPaperTradingEngine() {
 
         // --- 1. EXIT LOGIC ---
         if (longPos && shortPos) {
-          const initialSize = Math.max(longPos.size, shortPos.size);
-          const targetNetProfit = (initialSize * currentPrice) * (takeProfitPct / 100);
+          const primaryPos = longPos.openedAt < shortPos.openedAt ? longPos : shortPos;
+          const targetNetProfit = (primaryPos.size * primaryPos.entryPrice) * (takeProfitPct / 100);
           
-          if (totalUnrealizedPnl >= targetNetProfit && totalUnrealizedPnl > 0) {
+          const realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + (shortPos.realizedHedgeProfit || 0);
+          const totalNetProfit = totalUnrealizedPnl + realizedHedgeProfit;
+          
+          // Exit both legs if total net profit covers losses + fees (BEP + small profit)
+          // We use targetNetProfit * 0.25 as a small buffer for BEP to ensure fees are covered
+          const bepTarget = targetNetProfit * 0.25;
+          if (totalNetProfit >= bepTarget && totalNetProfit > 0) {
             await closePos(longPos, 'Net Take Profit (Hedge Resolved)');
             await closePos(shortPos, 'Net Take Profit (Hedge Resolved)');
             longPos = undefined; shortPos = undefined;
-          } else {
-            if (longPos.pnlPct >= takeProfitPct) {
-              await closePos(longPos, 'Take Profit (Unlock)');
-              longPos = undefined;
-            }
-            if (shortPos && shortPos.pnlPct >= takeProfitPct) {
-              await closePos(shortPos, 'Take Profit (Unlock)');
-              shortPos = undefined;
-            }
           }
         } else {
-          if (longPos && longPos.pnlPct >= takeProfitPct) {
-            await closePos(longPos, 'Take Profit');
-            longPos = undefined;
+          if (longPos) {
+            const targetProfit = (longPos.size * longPos.entryPrice) * (takeProfitPct / 100);
+            const totalNetProfit = longPos.currentPnl + (longPos.realizedHedgeProfit || 0);
+            if (totalNetProfit >= targetProfit && totalNetProfit > 0) {
+              await closePos(longPos, 'Take Profit');
+              longPos = undefined;
+            }
           }
-          if (shortPos && shortPos.pnlPct >= takeProfitPct) {
-            await closePos(shortPos, 'Take Profit');
-            shortPos = undefined;
+          if (shortPos) {
+            const targetProfit = (shortPos.size * shortPos.entryPrice) * (takeProfitPct / 100);
+            const totalNetProfit = shortPos.currentPnl + (shortPos.realizedHedgeProfit || 0);
+            if (totalNetProfit >= targetProfit && totalNetProfit > 0) {
+              await closePos(shortPos, 'Take Profit');
+              shortPos = undefined;
+            }
           }
         }
 
@@ -2698,9 +2738,9 @@ async function runPaperTradingEngine() {
         const lockTrigger = setting.lockTriggerPct || 2.0;
         if (setting.lock11Mode) {
           if (longPos && !shortPos && longPos.pnlPct <= -lockTrigger) {
-            shortPos = await openPos('SHORT', longPos.size, 'Lock 1:1 (Hedge)');
+            shortPos = await openPos('SHORT', longPos.size, 'Lock 1:1 (Hedge)', 'HEDGE_TRIGGER');
           } else if (shortPos && !longPos && shortPos.pnlPct <= -lockTrigger) {
-            longPos = await openPos('LONG', shortPos.size, 'Lock 1:1 (Hedge)');
+            longPos = await openPos('LONG', shortPos.size, 'Lock 1:1 (Hedge)', 'HEDGE_TRIGGER');
           }
         }
 
@@ -2716,22 +2756,78 @@ async function runPaperTradingEngine() {
               
               if (!longPos && !shortPos) {
                 // New Entry
-                const tradeAmount = wallet.freeMargin * 0.1;
-                if (tradeAmount > 10) {
-                  const size = tradeAmount / currentPrice;
+                const entryMultiplier = setting.structure21Mode ? 2.0 : 1.0;
+                let size = (wallet.balance / currentPrice) * entryMultiplier;
+                
+                // Limit entry size based on maxMrPct
+                const maxAllowedSize = (wallet.balance * ((setting.maxMrPct || 25.0) / 100)) / currentPrice;
+                if (size > maxAllowedSize) size = maxAllowedSize;
+                
+                if (size * currentPrice > 10) { // Minimum trade size check
                   if (signalSide === 'LONG') longPos = await openPos('LONG', size, 'AI Signal Entry', freshSignal.id);
                   else shortPos = await openPos('SHORT', size, 'AI Signal Entry', freshSignal.id);
                 }
-              } else if (longPos && shortPos && (setting.add05Mode || setting.structure21Mode)) {
-                // Hedged, add to structure
-                const baseSize = Math.min(longPos.size, shortPos.size);
-                const addRatio = setting.add05Mode ? 0.5 : 1.0;
-                const additionalSize = baseSize * addRatio;
+              } else if ((longPos && !shortPos) || (shortPos && !longPos)) {
+                // Unhedged Add 0.5 Mode
+                const pos = longPos || shortPos;
+                if (setting.add05Mode && signalSide === pos.side) {
+                  await addSize(pos, pos.size * 0.5, `Add 0.5x to ${pos.side} (Unhedged)`, freshSignal.id);
+                }
+              } else if (longPos && shortPos) {
+                // Hedged Logic
                 
-                if (signalSide === 'LONG' && longPos.size < baseSize * 2) {
-                  await addSize(longPos, additionalSize, `Add ${addRatio}x to Long (Structure)`, freshSignal.id);
-                } else if (signalSide === 'SHORT' && shortPos.size < baseSize * 2) {
-                  await addSize(shortPos, additionalSize, `Add ${addRatio}x to Short (Structure)`, freshSignal.id);
+                // A. Unlocking Logic (Close hedge if in profit and signal aligns)
+                if (signalSide === 'LONG' && shortPos.currentPnl > 0) {
+                  const realized = shortPos.currentPnl;
+                  await closePos(shortPos, 'Unlock (Hedge in Profit)');
+                  shortPos = undefined;
+                  if (longPos) {
+                    longPos.realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + realized;
+                    await setDoc(doc(db, 'paper_positions', longPos.id), { realizedHedgeProfit: longPos.realizedHedgeProfit }, { merge: true });
+                  }
+                } else if (signalSide === 'SHORT' && longPos.currentPnl > 0) {
+                  const realized = longPos.currentPnl;
+                  await closePos(longPos, 'Unlock (Hedge in Profit)');
+                  longPos = undefined;
+                  if (shortPos) {
+                    shortPos.realizedHedgeProfit = (shortPos.realizedHedgeProfit || 0) + realized;
+                    await setDoc(doc(db, 'paper_positions', shortPos.id), { realizedHedgeProfit: shortPos.realizedHedgeProfit }, { merge: true });
+                  }
+                }
+                
+                // B. Revert to 1:1 Lock (Reduce Dominant Leg if trend reverses)
+                if (longPos && shortPos) {
+                  if (signalSide === 'SHORT' && longPos.size > shortPos.size) {
+                    const excessSize = longPos.size - shortPos.size;
+                    const excessPnl = (currentPrice - longPos.entryPrice) * excessSize;
+                    if (excessPnl > 0) {
+                      await partialClosePos(longPos, excessSize, 'Revert to 1:1 Lock (Excess in Profit)');
+                      longPos.realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + excessPnl;
+                      await setDoc(doc(db, 'paper_positions', longPos.id), { realizedHedgeProfit: longPos.realizedHedgeProfit }, { merge: true });
+                    }
+                  } else if (signalSide === 'LONG' && shortPos.size > longPos.size) {
+                    const excessSize = shortPos.size - longPos.size;
+                    const excessPnl = (shortPos.entryPrice - currentPrice) * excessSize;
+                    if (excessPnl > 0) {
+                      await partialClosePos(shortPos, excessSize, 'Revert to 1:1 Lock (Excess in Profit)');
+                      shortPos.realizedHedgeProfit = (shortPos.realizedHedgeProfit || 0) + excessPnl;
+                      await setDoc(doc(db, 'paper_positions', shortPos.id), { realizedHedgeProfit: shortPos.realizedHedgeProfit }, { merge: true });
+                    }
+                  }
+                }
+                
+                // C. Add 0.5 Mode (If both legs are red)
+                if (longPos && shortPos && setting.add05Mode) {
+                  if (longPos.currentPnl < 0 && shortPos.currentPnl < 0) {
+                    const baseSize = Math.min(longPos.size, shortPos.size);
+                    const additionalSize = baseSize * 0.5;
+                    
+                    if (signalSide === 'LONG' && longPos.size < baseSize * 2) {
+                      await addSize(longPos, additionalSize, `Add 0.5x to Long (Structure)`, freshSignal.id);
+                    } else if (signalSide === 'SHORT' && shortPos.size < baseSize * 2) {
+                      await addSize(shortPos, additionalSize, `Add 0.5x to Short (Structure)`, freshSignal.id);
+                    }
+                  }
                 }
               }
             }
@@ -2745,10 +2841,14 @@ async function runPaperTradingEngine() {
         // Update Monitoring Plan
         let plan = 'Waiting for AI Signal...';
         if (longPos && shortPos) {
-          plan = `Hedged (Lock 1:1). Net PnL: $${totalUnrealizedPnl.toFixed(2)}. Waiting for Net TP or Add Signal.`;
+          const realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + (shortPos.realizedHedgeProfit || 0);
+          const totalNetProfit = totalUnrealizedPnl + realizedHedgeProfit;
+          plan = `Hedged (Lock 1:1). Net PnL: $${totalNetProfit.toFixed(2)}. Waiting for Net TP or Add Signal.`;
         } else if (longPos || shortPos) {
           const pos = longPos || shortPos;
-          plan = `Monitoring ${pos.side} for TP (+${takeProfitPct}%). PnL: $${pos.currentPnl.toFixed(2)}. Lock Trigger: -${lockTrigger}%.`;
+          const realizedHedgeProfit = pos.realizedHedgeProfit || 0;
+          const totalNetProfit = pos.currentPnl + realizedHedgeProfit;
+          plan = `Monitoring ${pos.side} for TP (+${takeProfitPct}%). Net PnL: $${totalNetProfit.toFixed(2)}. Lock Trigger: -${lockTrigger}%.`;
         }
         await setDoc(monitoringRef, { symbol, timeframe, currentPrice, plan, updatedAt: new Date().toISOString() }, { merge: true });
 
@@ -3468,7 +3568,7 @@ app.post('/api/bot/toggle', async (req, res) => {
       await monitorMarkets(true);
       monitorInterval = setInterval(() => {
         monitorMarkets().catch(console.error);
-      }, 900000); // 15 minutes
+      }, 3600000); // 1 hour
       isBotRunning = true;
       res.json({ isBotRunning });
     } catch (error: any) {
@@ -3478,9 +3578,14 @@ app.post('/api/bot/toggle', async (req, res) => {
 });
 
 app.post('/api/bot/force-run', (req, res) => {
+  // Check if request comes from UI (has origin or referer)
+  // Cron jobs typically don't send these headers
+  const isUiRequest = !!(req.headers.origin || req.headers.referer);
+  const force = isUiRequest;
+  
   // Run in background to prevent browser timeout
-  monitorMarkets(true).catch(err => console.error('Force run failed in background:', err));
-  res.json({ success: true, message: 'Bot run started in background' });
+  monitorMarkets(force).catch(err => console.error('Force run failed in background:', err));
+  res.json({ success: true, message: `Bot run started in background (force: ${force})` });
 });
 
 app.get('/api/signals', (req, res) => {

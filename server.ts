@@ -2767,12 +2767,6 @@ async function runPaperTradingEngine() {
                   if (signalSide === 'LONG') longPos = await openPos('LONG', size, 'AI Signal Entry', freshSignal.id);
                   else shortPos = await openPos('SHORT', size, 'AI Signal Entry', freshSignal.id);
                 }
-              } else if ((longPos && !shortPos) || (shortPos && !longPos)) {
-                // Unhedged Add 0.5 Mode
-                const pos = longPos || shortPos;
-                if (setting.add05Mode && signalSide === pos.side) {
-                  await addSize(pos, pos.size * 0.5, `Add 0.5x to ${pos.side} (Unhedged)`, freshSignal.id);
-                }
               } else if (longPos && shortPos) {
                 // Hedged Logic
                 
@@ -2940,25 +2934,6 @@ async function runBacktest(
                 amount: currentTrade.amount // 1:1 Lock
               });
             }
-          }
-        }
-
-        // Check for Add 0.5 Mode (Unhedged)
-        if (add05Mode && hedgeTrades.length === 0) {
-          if (currentTrade.type === 'LONG' && longSignal[i]) {
-            // Add 0.5x to position
-            const addAmount = currentTrade.amount * 0.5;
-            const newAmount = currentTrade.amount + addAmount;
-            const newEntryPrice = ((currentTrade.entryPrice * currentTrade.amount) + (close * addAmount)) / newAmount;
-            currentTrade.amount = newAmount;
-            currentTrade.entryPrice = newEntryPrice;
-          } else if (currentTrade.type === 'SHORT' && shortSignal[i]) {
-            // Add 0.5x to position
-            const addAmount = currentTrade.amount * 0.5;
-            const newAmount = currentTrade.amount + addAmount;
-            const newEntryPrice = ((currentTrade.entryPrice * currentTrade.amount) + (close * addAmount)) / newAmount;
-            currentTrade.amount = newAmount;
-            currentTrade.entryPrice = newEntryPrice;
           }
         }
 

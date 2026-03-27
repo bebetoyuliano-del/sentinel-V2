@@ -10,11 +10,23 @@ import { createServer as createViteServer } from 'vite';
 import { RSI, MACD, EMA, BollingerBands, SMA } from 'technicalindicators';
 import { Storage } from '@google-cloud/storage';
 import { initializeApp } from 'firebase/app';
-import { getFirestore, doc, setDoc, getDoc, collection, query, orderBy, limit, getDocs, serverTimestamp, setLogLevel, deleteDoc, where } from 'firebase/firestore';
+import { initializeFirestore, doc, setDoc, getDoc, collection, query, orderBy, limit, getDocs, serverTimestamp, setLogLevel, deleteDoc, where } from 'firebase/firestore';
 import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword } from 'firebase/auth';
 import fs from 'fs';
 import path from 'path';
 import cron from 'node-cron';
+
+import { BacktestResult, BacktestSummary, BacktestTrade, BacktestSettings } from './src/types/backtest';
+import { Ohlcv, PerSide, PerSymbolPos, ExcelRow } from './src/types/decisionCard';
+import { PolicyContext } from './src/types/policyContext';
+import { atr14Last, deriveVolatilityRegime } from './src/utils/Math';
+import { normalizeSymbolInput } from './src/utils/Symbol';
+import { normalizeActionInput, parseTelegramCallbackData } from './src/utils/ActionParsers';
+import { composeExcelRows } from './src/utils/ExcelBuilder';
+import { escapeHtml, renderDecisionCardsToTelegram } from './src/renderers/TelegramRenderer';
+import { sendTelegramMessage, sendInteractiveMenu, sendTradingMenu, sendHedgeMenu } from './src/services/TelegramService';
+import { uploadAnalysisToGCS } from './src/services/GCSService';
+import { PolicyMapper } from './src/core/PolicyMapper';
 
 enum OperationType {
   CREATE = 'create',
@@ -125,7 +137,7 @@ async function initFirebase() {
     const firebaseConfig = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'firebase-applet-config.json'), 'utf8'));
     const app = initializeApp(firebaseConfig);
     setLogLevel('error'); // Suppress idle stream warnings
-    db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+    db = initializeFirestore(app, { experimentalForceLongPolling: true }, firebaseConfig.firestoreDatabaseId);
     auth = getAuth(app);
     
     const serverEmail = 'server@sentinel.local';
@@ -527,133 +539,7 @@ let paperTradingInterval: NodeJS.Timeout | null = null;
 let latestDecisionCards: any[] = [];
 
 // Helper to send Telegram message
-async function sendTelegramMessage(text: string, reply_markup?: any) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-  
-  // Telegram limits messages to 4096 characters. We split at 4000 to be safe.
-  const MAX_LENGTH = 4000;
-  const messages = [];
-  
-  if (text.length <= MAX_LENGTH) {
-    messages.push(text);
-  } else {
-    // Split by double newline to keep paragraphs intact if possible
-    const paragraphs = text.split('\n\n');
-    let currentMessage = '';
-    
-    for (const paragraph of paragraphs) {
-      if ((currentMessage + paragraph + '\n\n').length <= MAX_LENGTH) {
-        currentMessage += paragraph + '\n\n';
-      } else {
-        if (currentMessage) messages.push(currentMessage.trim());
-        // If a single paragraph is still too long, split it by chunks
-        if (paragraph.length > MAX_LENGTH) {
-          let remaining = paragraph;
-          while (remaining.length > 0) {
-            messages.push(remaining.substring(0, MAX_LENGTH));
-            remaining = remaining.substring(MAX_LENGTH);
-          }
-          currentMessage = '';
-        } else {
-          currentMessage = paragraph + '\n\n';
-        }
-      }
-    }
-    if (currentMessage) messages.push(currentMessage.trim());
-  }
-
-  try {
-    for (let i = 0; i < messages.length; i++) {
-      const msg = messages[i];
-      // Only attach reply_markup to the last message part
-      const options: any = {
-        chat_id: TELEGRAM_CHAT_ID,
-        text: msg,
-        parse_mode: 'HTML' // Enable HTML parsing for better formatting
-      };
-      
-      if (i === messages.length - 1 && reply_markup) {
-        options.reply_markup = reply_markup;
-      }
-
-      try {
-        await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, options);
-      } catch (htmlError: any) {
-        console.warn('Failed to send HTML message, retrying as plain text:', htmlError.response?.data || htmlError.message);
-        // Fallback to plain text
-        delete options.parse_mode;
-        // Strip HTML tags for plain text readability (basic strip)
-        options.text = msg.replace(STRIP_TAGS, ''); 
-        await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, options);
-      }
-      
-      // Add a small delay between messages to avoid rate limiting
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
-    console.log(`Successfully sent ${messages.length} Telegram message(s).`);
-  } catch (error: any) {
-    console.error('Failed to send Telegram message (Final):', error.response?.data || error.message);
-  }
-}
-
-async function sendInteractiveMenu() {
-    const menu = {
-        inline_keyboard: [
-            [
-                { text: "📊 Status", callback_data: "menu_status" },
-                { text: "🛡️ Mode", callback_data: "menu_mode" }
-            ],
-            [
-                { text: "🎮 Demo", callback_data: "menu_demo" },
-                { text: "📈 Trading", callback_data: "menu_trading" }
-            ],
-            [
-                { text: "🔒 Hedge/Lock", callback_data: "menu_hedge" },
-                { text: "❓ Help", callback_data: "menu_help" }
-            ]
-        ]
-    };
-    await sendTelegramMessage("🤖 <b>Main Menu</b>\n\nWhat would you like to do?", menu);
-}
-
-async function sendTradingMenu() {
-    const menu = {
-        inline_keyboard: [
-            [
-                { text: "💰 Take Profit", callback_data: "menu_tp" },
-                { text: "📉 Reduce Long", callback_data: "menu_rl" }
-            ],
-            [
-                { text: "📈 Reduce Short", callback_data: "menu_rs" },
-                { text: "➕ Add Long", callback_data: "menu_al" }
-            ],
-            [
-                { text: "➖ Add Short", callback_data: "menu_as" },
-                { text: "« Back", callback_data: "menu_main" }
-            ]
-        ]
-    };
-    await sendTelegramMessage("📈 <b>Trading Actions</b>\n\nSelect an action. Note: These buttons will guide you to provide a symbol.", menu);
-}
-
-async function sendHedgeMenu() {
-    const menu = {
-        inline_keyboard: [
-            [
-                { text: "🔒 Hedge On", callback_data: "menu_ho" },
-                { text: "⚖️ Lock Neutral", callback_data: "menu_ln" }
-            ],
-            [
-                { text: "🔓 Unlock", callback_data: "menu_ul" },
-                { text: "🔄 Role", callback_data: "menu_rr" }
-            ],
-            [
-                { text: "« Back", callback_data: "menu_main" }
-            ]
-        ]
-    };
-    await sendTelegramMessage("🔒 <b>Hedge & Lock Actions</b>\n\nSelect an action.", menu);
-}
+// Extracted to src/services/TelegramService.ts
 
 // Helper to send data to Power Automate Webhook
 async function sendPowerAutomateWebhook(data: any) {
@@ -671,64 +557,7 @@ async function sendPowerAutomateWebhook(data: any) {
 }
 
 // Helper: upload analysis JSON ke GCS lalu kembalikan URL (public atau signed)
-async function uploadAnalysisToGCS(analysisData: any, metadata: Record<string, any> = {}) {
-  if (!GCS_BUCKET) {
-    console.warn("⚠️ GCS upload skipped: GCS_BUCKET not set.");
-    return null;
-  }
-  try {
-    // Buat nama objek deterministik & mudah dicari
-    const ts = new Date().toISOString().replace(/[:.]/g,'-');
-    const sym = Array.isArray(analysisData?.decision_cards) && analysisData.decision_cards[0]?.symbol
-                ? String(analysisData.decision_cards[0].symbol).replace(/[^\w\-./]/g, "_")
-                : "UNSPEC";
-    const objectName = `${GCS_PREFIX.replace(/\/+$/,"")}/${ts}_${sym}.json`;
-
-    const body = JSON.stringify({
-      uploaded_at: new Date().toISOString(),
-      meta: metadata || {},
-      analysis: analysisData
-    }, null, 2);
-
-    let url: string | null = null;
-
-    const storage = new Storage(); // gunakan ADC/GOOGLE_APPLICATION_CREDENTIALS
-    const bucket = storage.bucket(GCS_BUCKET);
-
-    // Check if bucket exists first to avoid confusing permission errors if it doesn't
-    const [exists] = await bucket.exists().catch(() => [false]);
-    if (!exists) {
-      console.warn(`⚠️ GCS bucket '${GCS_BUCKET}' not found or inaccessible. Skipping upload.`);
-      return null;
-    }
-
-    const file = bucket.file(objectName);
-
-    await file.save(body, {
-      resumable: false,
-      contentType: "application/json; charset=utf-8",
-      metadata: { cacheControl: "no-store" }
-    });
-
-    // Karena bucket tidak bisa dibuat public (Org Policy), kita SELALU gunakan Signed URL
-    // Signed URL v4 (GET) dengan TTL dari env
-    const [signed] = await file.getSignedUrl({
-      action: "read",
-      expires: Date.now() + (Math.max(60, GCS_SIGNED_URL_TTL) * 1000) // min 60s
-    });
-    url = signed;
-
-    console.log("✅ GCS uploaded:", objectName);
-    return { objectName, url };
-  } catch (e: any) {
-    const errorMsg = e.message || e;
-    console.error(`❌ GCS upload failed: ${errorMsg}`);
-    if (errorMsg.includes('storage.objects.create')) {
-      console.error(`💡 ACTION REQUIRED: The service account 'ais-sandbox@ais-asia-southeast1-7ebde40c3e.iam.gserviceaccount.com' does not have permission to create objects in bucket '${GCS_BUCKET}'. Please grant it the 'Storage Object Creator' role in the Google Cloud Console.`);
-    }
-    return null;
-  }
-}
+// Extracted to src/services/GCSService.ts
 
 // Helper to fetch market data with technical indicators
 async function fetchMarketDataWithIndicators(symbols: string[]) {
@@ -1058,230 +887,7 @@ async function generateWithRetry(prompt: string, modelName: string = 'gemini-3.1
 }
 
 // --- EXCEL ROWS BUILDER (A-D) ---
-type Ohlcv = [number, number, number, number, number, number]; // ts,o,h,l,c,v
-
-function atr14Last(ohlcv: Ohlcv[]): number | null {
-  const n = 14;
-  if (!ohlcv || ohlcv.length < n + 1) return null;
-  const highs = ohlcv.map(c => c[2]);
-  const lows  = ohlcv.map(c => c[3]);
-  const closes= ohlcv.map(c => c[4]);
-
-  const tr: number[] = [0];
-  for (let i = 1; i < ohlcv.length; i++) {
-    const h = highs[i], l = lows[i], pc = closes[i - 1];
-    tr.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
-  }
-  let atr = tr[1];
-  for (let i = 2; i <= n; i++) atr = (atr * (n - 1) + tr[i]) / n;
-  for (let i = n + 1; i < tr.length; i++) atr = (atr * (n - 1) + tr[i]) / n;
-  return atr || null;
-}
-
-function deriveVolatilityRegime(atrPct: number | null | undefined) {
-  if (atrPct == null) return '';
-  if (atrPct < 1.0)  return 'LOW';
-  if (atrPct <= 2.5) return 'NORMAL';
-  return 'HIGH';
-}
-
-type PerSide = { qty: number; entry: number; pnl: number; bep?: number|null; liq?: number|null; marginUsed?: number|null; };
-type PerSymbolPos = {  long: PerSide; short: PerSide;  netQtyUSDT: number | null; netDirection: 'NET_LONG'|'NET_SHORT'|'LOCKED'; netBEP: number | null;};
-
-function mapPositionsForSymbol(allPositions: any[], symbol: string, lastPrice?: number): PerSymbolPos {
-  const same = (p: any) => p.symbol === symbol;
-  const longPos  = allPositions.find((p: any) => same(p) && (p.side === 'long' || (p.side === 'both' && parseFloat(p.info.positionAmt) > 0)));
-  const shortPos = allPositions.find((p: any) => same(p) && (p.side === 'short' || (p.side === 'both' && parseFloat(p.info.positionAmt) < 0)));
-  const long: PerSide = {
-    qty: longPos ? Math.abs(longPos.contracts) : 0,
-    entry: longPos?.entryPrice ?? 0,
-    pnl: longPos?.unrealizedPnl ?? 0,
-    bep: longPos?.entryPrice ?? null,
-    liq: longPos?.liquidationPrice ?? longPos?.info?.liquidationPrice ?? null,
-    marginUsed: longPos?.initialMargin ?? longPos?.info?.initialMargin ?? null
-  };
-  const short: PerSide = {
-    qty: shortPos ? Math.abs(shortPos.contracts) : 0,
-    entry: shortPos?.entryPrice ?? 0,
-    pnl: shortPos?.unrealizedPnl ?? 0,
-    bep: shortPos?.entryPrice ?? null,
-    liq: shortPos?.liquidationPrice ?? shortPos?.info?.liquidationPrice ?? null,
-    marginUsed: shortPos?.initialMargin ?? shortPos?.info?.initialMargin ?? null
-  };
-  let netQtyUSDT: number | null = null;
-  if (lastPrice && (long.qty > 0 || short.qty > 0)) {
-    netQtyUSDT = Math.abs(long.qty - short.qty) * lastPrice;
-  }
-  const netDirection = long.qty === short.qty ? 'LOCKED' : (long.qty > short.qty ? 'NET_LONG' : 'NET_SHORT');
-  let netBEP: number | null = null;
-  if (long.qty === short.qty && long.qty > 0) {
-    netBEP = (long.entry + short.entry) / 2;
-  } else if (long.qty !== short.qty && long.entry && short.entry) {
-    const longNotional  = long.entry  * long.qty;
-    const shortNotional = short.entry * short.qty;
-    const diffContracts = (long.qty - short.qty);
-    if (diffContracts !== 0) netBEP = (longNotional - shortNotional) / diffContracts;
-  }
-  return { long, short, netQtyUSDT, netDirection, netBEP };
-}
-
-function deriveBiasStrength4H(trend4h: string | null | undefined, waeExploding?: boolean | null) {
-  if (!trend4h || trend4h.toUpperCase() === 'NEUTRAL' || trend4h.toUpperCase() === 'NETRAL') return 'RANGE';
-  const strong = !!waeExploding;
-  if (trend4h.toUpperCase() === 'UP')   return strong ? 'STRONG_UP' : 'WEAK_UP';
-  if (trend4h.toUpperCase() === 'DOWN') return strong ? 'STRONG_DOWN' : 'WEAK_DOWN';
-  return 'RANGE';
-}
-
-function deriveBiasStrength1H(structure1h: string | null | undefined) {
-  const s = (structure1h || '').toUpperCase();
-  if (!s) return 'RANGE';
-  if (s.includes('BOS') || s.includes('CHOCH')) {
-    return s.includes('_BULL') ? 'STRONG_UP' : 'STRONG_DOWN';
-  }
-  return 'RANGE';
-}
-
-function deriveActionRiskType(action?: string, mrDelta?: number | null) {
-  if (!action) return 'NEUTRAL';
-  const A = action.toUpperCase();
-  if (A.startsWith('LOCK')) return 'LOCK';
-  if (A.startsWith('TAKE')) return 'DE_RISK';
-  if (A.startsWith('ADD') || A === 'HEDGE_ON' || A === 'ROLE') return 'EXPAND';
-  if (typeof mrDelta === 'number') return mrDelta < 0 ? 'DE_RISK' : (mrDelta > 0 ? 'EXPAND' : 'NEUTRAL');
-  return 'NEUTRAL';
-}
-
-function deriveRiskTag(accountMrDecimal?: number | null, mrDelta?: number | null): 'CRITICAL'|'HIGH'|'NORMAL'|'LOW'|'' {
-  if (accountMrDecimal == null) return '';
-  if (accountMrDecimal >= 0.60) return 'CRITICAL';
-  if (accountMrDecimal >= 0.25) return 'HIGH';
-  if (typeof mrDelta === 'number' && mrDelta > 0) return 'HIGH';
-  if (accountMrDecimal < 0.15) return 'LOW';
-  return 'NORMAL';
-}
-
-type ExcelRow = {
-  Ts: string; Symbol: string; Timeframe: string;
-  Bias4H: string; BiasStrength4H: string; Bias1H: string; BiasStrength1H: string;
-  ATR4H: number | ''; ATR1H: number | ''; VolatilityRegime: string;
-  Pivot: number | ''; StopHedge: number | '';
-  SupplyLow: number | ''; SupplyHigh: number | '';
-  DemandLow: number | ''; DemandHigh: number | '';
-  KeyLevel1: number | ''; KeyLevel2: number | ''; ZoneQuality: string;
-  LongQty: number | ''; LongEntry: number | ''; LongPnL: number | '';
-  LongBEP: number | ''; LongLiqPrice: number | ''; LongMarginUsed: number | '';
-  ShortQty: number | ''; ShortEntry: number | ''; ShortPnL: number | '';
-  ShortBEP: number | ''; ShortLiqPrice: number | ''; ShortMarginUsed: number | '';
-  NetQtyUSDT: number | ''; NetDirection: string; NetBEP: number | ''; RatioHint: string;
-  'AccountMR%': number | ''; 'MR%': string | ''; MRProjected: number | '';
-  MRDeltaIfAction: number | ''; PairRiskWeight: number | ''; RiskTag: string;
-  Action: string; StrategyMode: string; RecoveryPhase: string; ActionRiskType: string;
-  ActionSuggested: string; Status: string; Notes: string; BEP_2to1: number | '';
-  ArchiveKey: string; SourceEmailId: string; FileName: string;
-};
-
-function composeExcelRows(params: {
-  cards: any[]; positions: any[]; marketData: any; accountRisk: any;
-}): ExcelRow[] {
-  const rows: ExcelRow[] = [];
-  const accMrPct = params?.accountRisk?.marginRatio ?? null; // % 0..100
-  const accMrDecimal = accMrPct != null ? accMrPct / 100 : null;
-  const wallet = params?.accountRisk?.walletBalance ?? null;
-  for (const c of (params.cards || [])) {
-    const symbol = (c.symbol || '').split(':')[0]; // "BASE/USDT"
-    const md = params.marketData[symbol] || params.marketData[`${symbol}:USDT`] || {};
-    const md4 = md?.TF_4H || {};
-    const md1 = md?.TF_1H || {};
-    const priceNow = md?.currentPrice ?? null;
-    const per = mapPositionsForSymbol(params.positions, symbol, priceNow);
-    const bias4h = (c?.structure?.trend_4h || 'NETRAL').toString().toUpperCase().replace('NEUTRAL','NETRAL');
-    const bias1h = (c?.structure?.smc_1h?.structure || 'UNKNOWN').toString().toUpperCase();
-    const bs4h   = deriveBiasStrength4H(bias4h, md4?.WAE?.isExploding ?? null);
-    const bs1h   = deriveBiasStrength1H(bias1h);
-    const atr4h = md4?.ATR14 ?? null;
-    const atr1h = md1?.ATR14 ?? null;
-    const atrPct4h = (atr4h && priceNow) ? (atr4h / priceNow) * 100 : null;
-    const volReg = deriveVolatilityRegime(atrPct4h);
-    const pivot   = (c?.levels?.pivot ?? md4?.RQK_Channel?.estimate ?? null);
-    const stopHdg = (c?.levels?.stop_hedge_lock ?? null);
-    const supplyLo = c?.levels?.supply?.zone?.[0] ?? '';
-    const supplyHi = c?.levels?.supply?.zone?.[1] ?? '';
-    const demandLo = c?.levels?.demand?.zone?.[0] ?? '';
-    const demandHi = c?.levels?.demand?.zone?.[1] ?? '';
-    const ratioHint = c?.positions?.ratio_hint ?? 'OTHER';
-    const netQtyUSDT = per.netQtyUSDT ?? '';
-    const netDir = per.netDirection;
-    const netBEP = per.netBEP ?? '';
-    const mrProjectedPct = typeof c?.action_now?.mr_projected_if_action === 'number'
-      ? c.action_now.mr_projected_if_action
-      : '';
-    const mrDelta = (typeof mrProjectedPct === 'number' && accMrPct != null)
-      ? (mrProjectedPct/100 - accMrPct/100)
-      : '';
-    const pairWeight = (wallet && priceNow && (per.long.qty || per.short.qty))
-      ? (((per.long.qty * priceNow) + (per.short.qty * priceNow)) / wallet)
-      : '';
-    const action = c?.action_now?.action || c?.action || 'HOLD';
-    const actRisk = deriveActionRiskType(action, typeof mrDelta === 'number' ? mrDelta : null);
-    const riskTag = deriveRiskTag(accMrDecimal, typeof mrDelta === 'number' ? mrDelta : null);
-    const tsIso = new Date().toISOString();
-    const archiveKey = `${tsIso}|${symbol}|4H`;
-    rows.push({
-      Ts: tsIso,
-      Symbol: symbol,
-      Timeframe: '4H',
-      Bias4H: bias4h,
-      BiasStrength4H: bs4h,
-      Bias1H: bias1h,
-      BiasStrength1H: bs1h,
-      ATR4H: atr4h ?? '',
-      ATR1H: atr1h ?? '',
-      VolatilityRegime: volReg,
-      Pivot: pivot ?? '',
-      StopHedge: stopHdg ?? '',
-      SupplyLow: supplyLo,
-      SupplyHigh: supplyHi,
-      DemandLow: demandLo,
-      DemandHigh: demandHi,
-      KeyLevel1: '', KeyLevel2: '', ZoneQuality: '',
-      LongQty: per.long.qty || '',
-      LongEntry: per.long.entry || '',
-      LongPnL: per.long.pnl || '',
-      LongBEP: per.long.bep ?? '',
-      LongLiqPrice: per.long.liq ?? '',
-      LongMarginUsed: per.long.marginUsed ?? '',
-      ShortQty: per.short.qty || '',
-      ShortEntry: per.short.entry || '',
-      ShortPnL: per.short.pnl || '',
-      ShortBEP: per.short.bep ?? '',
-      ShortLiqPrice: per.short.liq ?? '',
-      ShortMarginUsed: per.short.marginUsed ?? '',
-      NetQtyUSDT: netQtyUSDT,
-      NetDirection: netDir,
-      NetBEP: netBEP,
-      RatioHint: ratioHint,
-      'AccountMR%': accMrDecimal ?? '',
-      'MR%': (accMrPct != null) ? `${accMrPct.toFixed(2)}%` : '',
-      MRProjected: typeof mrProjectedPct === 'number' ? mrProjectedPct : '',
-      MRDeltaIfAction: typeof mrDelta === 'number' ? mrDelta : '',
-      PairRiskWeight: pairWeight || '',
-      RiskTag: riskTag,
-      Action: action,
-      StrategyMode: c?.strategy_mode || 'RECOVERY',
-      RecoveryPhase: c?.recovery_phase || 'PHASE_1',
-      ActionRiskType: actRisk,
-      ActionSuggested: '',
-      Status: '',
-      Notes: '',
-      BEP_2to1: c?.action_now?.bep_price_if_2_to_1 ?? '',
-      ArchiveKey: archiveKey,
-      SourceEmailId: '',
-      FileName: ''
-    });
-  }
-  return rows;
-}
+// Extracted to src/utils/ExcelBuilder.ts
 // --- END EXCEL ROWS BUILDER ---
 
 // Helper to ensure auth is active
@@ -1534,6 +1140,231 @@ async function monitorMarkets(force = false) {
          - Jika harga spot bergerak melawan > 4% → struktur dianggap berat, fokus utama: de-risk.
 
       ============================================================
+      SECTION 2A – HIERARKI BACA TREND & KONFIRMASI PERUBAHAN TREND
+      ============================================================
+      ATURAN HIERARKI TREND (WAJIB):
+      - Arah trend utama WAJIB ditentukan oleh RF 4H (Range Filter timeframe 4H).
+      - Jika RF 4H berwarna GREEN → anggap arah trend utama = UP.
+      - Jika RF 4H berwarna RED → anggap arah trend utama = DOWN.
+      - Jika RF 4H belum jelas / baru flip tetapi belum stabil / konflik dengan struktur → anggap trend utama = UNCLEAR.
+      PERAN INDIKATOR SEKUNDER:
+      - VWAP, RQK, WAE, BOS, ChoCH, rejection Supply/Demand, dan price action
+      TIDAK BOLEH menggantikan RF 4H sebagai penentu utama arah trend.
+      - Indikator sekunder hanya berfungsi sebagai:
+        1) konfirmasi continuation,
+        2) early warning reversal,
+        3) konfirmasi reversal kuat.
+      ATURAN PENTING:
+      - Jika RF 4H belum berubah, indikator sekunder TIDAK BOLEH sendirian memaksa perubahan struktur secara agresif,
+        kecuali reversal sudah terkonfirmasi sangat kuat.
+      - AI WAJIB membedakan antara:
+      - continuation confirmed,
+      - reversal watch,
+      - reversal confirmed strong,
+      - chop / ambiguous market.
+
+      ============================================================
+      SECTION 2B – STATUS TREND RESMI (WAJIB
+      ============================================================
+      Setiap pair WAJIB diklasifikasikan ke salah satu status berikut:
+      1) CONTINUATION_CONFIRMED
+         - RF 4H searah dan indikator sekunder masih mendukung arah tersebut.
+         - Continuation dianggap sehat.
+         - Dalam kondisi ini, ADD 0.5 searah trend BOLEH dipertimbangkan jika semua guardrail aman.
+      2) REVERSAL_WATCH
+         - Ada tanda awal pelemahan trend:
+           • harga mulai mendekati / menembus VWAP,
+           • RQK mulai melemah / melawan arah trend utama,
+           • WAE melemah,
+           • muncul ChoCH / rejection awal berlawanan,
+           • follow-through continuation mulai buruk.
+         - REVERSAL_WATCH BUKAN sinyal untuk langsung membalik struktur.
+         - REVERSAL_WATCH hanya berfungsi untuk:
+           • menahan ADD baru,
+           • menahan ekspansi,
+           • memaksa WAIT & SEE,
+           • menunggu konfirmasi tambahan dari indikator institusional laiinya untuk reversal atau pullback.
+      3) REVERSAL_CONFIRMED_STRONG
+         - Pembalikan arah dianggap kuat hanya jika ada konfirmasi yang benar-benar jelas.
+         - Minimal interpretasi reversal kuat:
+           • Bias4H bergeser atau struktur besar berubah,
+           • Bias1H searah dengan arah pembalikan,
+           • dan/atau ada BOS / ChoCH / rejection kuat yang mendukung arah baru.
+           • indikator institusional yang dimiliki sentinel memberikan konfirmasi kuat
+         - Dalam kondisi ini, Sentinel boleh masuk ke logika REVERSAL DEFENSE:
+           • gunakan profit leg hijau untuk REDUCE bertahap ke Lock 1:1,
+           • baru pertimbangkan pergeseran ke 2:1 arah baru dengan Reduce Leg SHORT atau LONG  dengan syarat green atau profit jika struktur mendukung.
+       4) CHOP
+         - Jika arah tidak jelas, indikator sekunder saling bertentangan, follow-through lemah,
+           atau pair hanya bergerak bolak-balik tanpa continuation yang sehat,
+           maka pair dianggap CHOP.
+         - Dalam mode CHOP, AI DILARANG melakukan ekspansi recovery baru.
+         - Dalam mode CHOP, hanya boleh:
+           • HOLD,
+           • LOCK_NEUTRAL,
+           • TAKE_PROFIT defensif,
+           • REDUCE pada leg hijau bila valid.
+
+     ============================================================
+      SECTION 2C – CONTEXT MODE RESMI (WAJIB)
+     ============================================================ 
+     Untuk setiap pair yang memiliki posisi terbuka, AI WAJIB mengklasifikasikan pair tersebut ke salah satu Context Mode berikut:
+     1) CONTINUATION_RECOVERY
+      - Digunakan ketika leg yang sedang profit masih searah dengan trend dominan yang terkonfirmasi.
+      - Fokus:
+        • mempertahankan arah dominan,
+        • boleh ADD 0.5 searah trend jika valid,
+        • membangun struktur 2:1,
+        • mengejar BEP,
+        • lalu EXIT penuh.
+      2) REVERSAL_DEFENSE
+      - Digunakan ketika leg yang sedang profit mulai terancam oleh reversal kuat.
+      - Fokus:
+        • REDUCE bertahap pada leg hijau,
+        • kembali ke Lock 1:1,
+        • hanya jika reversal semakin kuat, struktur boleh bergeser ke 2:1 baru searah trend baru.
+      3) LOCK_WAIT_SEE
+      - Digunakan ketika pair berada dalam Lock 1:1, struktur berat, ambigu, atau belum ada continuation/reversal yang valid.
+      - Fokus:
+        • observasi,
+        • tidak ekspansi,
+        • jaga MR,
+        • tunggu sinyal yang benar-benar jelas.
+      4) EXIT_READY
+       - Digunakan ketika struktur 2:1 sudah mendekati / mencapai target BEP.
+       - Fokus:
+        • EXIT penuh kedua kaki,
+        • reset,
+        • kembali WAIT & SEE.
+      5) RISK_DENIED
+       - Digunakan ketika aksi yang secara teknikal terlihat menarik ternyata diblok oleh guardrail risiko,
+         misalnya karena MRProjected > 25%, struktur terlalu berat, atau konteks ambigu.
+       - Fokus:
+        • tidak ekspansi,
+        • tetap defensif.
+
+      ATURAN WAJIB:
+      - Context Mode WAJIB konsisten di:
+        • decision_cards,
+        • why_this_pair,
+        • reasoning AI,
+        • Telegram summary,
+        • paper trading state,
+        • server enforcement.
+
+     ============================================================
+      SECTION 2D – NO EXPANSION IF AMBIGUOUS
+     ===========================================================
+     Jika salah satu dari hal berikut TIDAK jelas:
+     - arah trend utama RF 4H,
+     - status trend (continuation / reversal watch / reversal confirmed strong / chop),
+     - identitas hedge leg,
+     - projected MR,
+     - struktur posisi saat ini (single / lock / 2:1),
+     - apakah pergerakan spot melawan posisi masih ≤ 4% atau sudah > 4%,
+       maka Sentinel DILARANG melakukan ekspansi.
+     Dalam kondisi ambigu, default jatuh ke:
+     - HOLD,
+     - LOCK_NEUTRAL,
+     - TAKE_PROFIT defensif,
+     - atau REDUCE pada leg hijau bila valid.
+    
+============================================================
+SECTION 2E – CHOP / DEAD MARKET FILTER
+============================================================
+
+Jika pair berada dalam kondisi CHOP berkepanjangan atau DEAD MARKET,
+maka pair masuk mode RECOVERY_SUSPENDED.
+
+Definisi DEAD MARKET / NON-RECOVERABLE CONTEXT:
+- RF 4H tidak memberi arah continuation recovery yang sehat,
+- indikator sekunder saling bertentangan atau lemah,
+- retracement tidak sehat,
+- follow-through continuation buruk,
+- volume / likuiditas buruk,
+- struktur tidak mendukung recovery rasional.
+
+Dalam mode RECOVERY_SUSPENDED:
+- DILARANG ADD 0.5,
+- DILARANG ekspansi recovery baru,
+- hanya boleh:
+  • HOLD,
+  • LOCK_NEUTRAL,
+  • TAKE_PROFIT defensif,
+  • REDUCE pada leg hijau bila valid,
+  • WAIT & SEE.
+
+============================================================
+SECTION 2F – APPROVED SETTINGS TIDAK BOLEH MENGALAHKAN SOP STRUKTURAL
+============================================================
+
+approvedSettings HANYA BOLEH mengganti parameter numerik / threshold spesifik pair,
+misalnya:
+- Take Profit,
+- Lock Trigger,
+- Max MR,
+- buffer,
+- parameter hasil backtest lain yang disetujui user.
+
+approvedSettings TIDAK BOLEH mengalahkan aturan struktural inti SOP,
+termasuk:
+- no reduce on red leg,
+- reduce hanya pada leg hijau,
+- unlock hanya jika hedge leg profit,
+- no expansion if MRProjected > 25%,
+- lock 1:1 = wait & see,
+- no aggressive add,
+- no expansion if ambiguous.
+
+Jika approvedSettings bertentangan dengan SOP struktural inti,
+maka SOP struktural inti HARUS menang.
+
+============================================================
+SECTION 2G – SAME PAIR SIGNALS HARUS DIKLASIFIKASIKAN DENGAN JELAS
+============================================================
+
+Jika AI memberikan sinyal baru pada pair yang SUDAH memiliki posisi terbuka,
+AI WAJIB mengklasifikasikan sinyal tersebut sebagai salah satu dari:
+
+1) NEW_INDEPENDENT_TREND_SIGNAL
+   - sinyal independen yang benar-benar baru,
+   - misalnya perubahan trend baru yang valid dan terpisah dari recovery sebelumnya.
+
+2) ADD_0_5_RECOVERY_SIGNAL
+   - sinyal yang merupakan bagian dari SOP recovery utama,
+   - yaitu ADD 0.5 konservatif untuk continuation recovery sesuai trend yang terkonfirmasi.
+
+ATURAN WAJIB:
+- Jika pair berada pada mode:
+  • LOCK_WAIT_SEE,
+  • CHOP,
+  • RECOVERY_SUSPENDED,
+  • RISK_DENIED,
+  maka sinyal ekspansi baru HARUS diblok.
+- why_this_pair WAJIB menjelaskan apakah sinyal itu continuation recovery, reversal defense, atau sinyal independen baru.
+
+============================================================
+SECTION 2H – FORMAT INTERNAL REASONING YANG WAJIB DIPAHAMI AI
+============================================================
+
+Untuk setiap pair dengan posisi terbuka, AI WAJIB secara internal memahami minimal informasi berikut:
+
+- PrimaryTrend4H = UP / DOWN / UNCLEAR
+- TrendStatus = CONTINUATION_CONFIRMED / REVERSAL_WATCH / REVERSAL_CONFIRMED_STRONG / CHOP
+- ContextMode = CONTINUATION_RECOVERY / REVERSAL_DEFENSE / LOCK_WAIT_SEE / EXIT_READY / RISK_DENIED
+- Structure = SINGLE / LOCK_1TO1 / LONG_2_SHORT_1 / LONG_1_SHORT_2 / OTHER
+- GreenLeg = LONG / SHORT / NONE
+- RedLeg = LONG / SHORT / NONE
+- HedgeLeg = LONG / SHORT / NONE
+- SizingHint = ADD_0.5_LONG / ADD_0.5_SHORT / LOCK_WAIT_SEE / EXPANSION_BLOCKED_BY_MR / NONE
+- BEPPrice = target BEP jika struktur 2:1
+- WhyAllowed = alasan aksi valid
+- WhyBlocked = alasan aksi diblok
+
+AI tidak wajib menampilkan semua field di output akhir JSON,
+tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel tetap konsisten.
+   
+      ============================================================
       SECTION 3 – PARAMETER RISIKO GLOBAL
       ============================================================
       Selalu patuhi guardrail berikut:
@@ -1685,32 +1516,59 @@ async function monitorMarkets(force = false) {
         - Trend baru benar-benar terkonfirmasi.
 
       6.4 KONDISI SALAH SATU LEG PROFIT, YANG LAIN RUGI
-      Jika salah satu sisi profit:
-      - ATURAN MUTLAK: JANGAN PERNAH menyarankan REDUCE atau CUT LOSS pada leg (posisi) yang sedang MERAH (Rugi/Floating Loss). REDUCE HANYA BOLEH dilakukan pada leg yang sedang HIJAU (Profit).
-      - HANYA BOLEH UNLOCK (Tutup posisi hedge) JIKA POSISI HEDGE TERSEBUT SEDANG PROFIT.
-      - Jika trend baru DOWN:
-          • Jika SHORT profit dan LONG rugi:
-              → boleh REDUCE_SHORT sebagian untuk kunci profit,
-                atau ADD_SHORT kecil di pullback bila masih aman.
-          • Jika LONG profit dan SHORT rugi:
-              → boleh REDUCE_LONG untuk mengamankan profit.
+          Jika salah satu sisi profit:
+          - ATURAN MUTLAK: JANGAN PERNAH menyarankan REDUCE atau CUT LOSS pada leg (posisi) yang sedang MERAH (Rugi/Floating Loss).
+          - HANYA BOLEH REDUCE pada leg yang sedang HIJAU (Profit).
+          - HANYA BOLEH UNLOCK (tutup posisi hedge) jika POSISI HEDGE TERSEBUT sedang PROFIT.
+          Prinsip umum:
+          - Sisi profit dapat dipakai sebagai sumber dana recovery.
+          - Sisi rugi (merah) HARUS DIBIARKAN (HOLD), di-LOCK, atau di-recovery dengan ADD searah trend, BUKAN di-reduce/cut loss.
 
-      - Jika trend baru UP (kebalikan skenario di atas):
-          • Jika LONG profit dan SHORT rugi:
-              → REDUCE_LONG atau ADD_LONG kecil.
-          • Jika SHORT profit dan LONG rugi:
-              → REDUCE_SHORT.
+        6.4A CONTINUATION CASE
+         Jika leg yang sedang profit masih SEARAH dengan trend baru yang terkonfirmasi:
+         - Boleh ADD 0.5 kecil pada pullback sehat searah trend.
+         - Tujuan: membangun struktur 2:1 sesuai arah trend dominan.
+         - Jika trend baru DOWN dan SHORT profit sementara LONG rugi:
+           → boleh ADD_SHORT kecil sampai struktur menjadi LONG 1 / SHORT 2,
+             lalu targetkan BEP dan EXIT penuh.
+         - Jika trend baru UP dan LONG profit sementara SHORT rugi:
+           → boleh ADD_LONG kecil sampai struktur menjadi LONG 2 / SHORT 1,
+             lalu targetkan BEP dan EXIT penuh.
+         - ADD 0.5 hanya boleh jika:
+           • trend benar-benar terkonfirmasi,
+           • pullback sehat,
+           • MRProjected setelah ADD tetap < 25%,
+           • struktur tidak sedang berat, ambigu, atau lock kusut.
 
-      - Prinsip:
-          • Sisi profit dapat dipakai sebagai sumber dana recovery.
-          • Sisi rugi (merah) HARUS DIBIARKAN (HOLD) atau di-recovery dengan ADD searah trend, BUKAN di-reduce/cut loss.
+        6.4B REVERSAL DEFENSE CASE
+         Jika leg yang sedang profit mulai TERANCAM karena reversal kuat berlawanan arah:
+         - Gunakan profit dari leg hijau untuk REDUCE bertahap leg yang dominan,
+           dengan tujuan kembali ke LOCK 1:1 terlebih dahulu.
+         - Jika SHORT profit dan LONG rugi, lalu reversal kuat ke arah UP terkonfirmasi:
+           → REDUCE_SHORT bertahap ke Lock 1:1.
+           → Jika reversal makin kuat dan struktur mendukung, posisi dapat bergeser ke LONG 2 / SHORT 1.
+         - Jika LONG profit dan SHORT rugi, lalu reversal kuat ke arah DOWN terkonfirmasi:
+           → REDUCE_LONG bertahap ke Lock 1:1.
+           → Jika reversal makin kuat dan struktur mendukung, posisi dapat bergeser ke LONG 1 / SHORT 2.
+         - REVERSAL DEFENSE tidak boleh langsung membalik struktur tanpa konfirmasi kuat.
+         - Jika reversal belum terkonfirmasi kuat, masuk mode WAIT & SEE dan tahan ekspansi baru.
+
+        Catatan:
+        - 6.4A digunakan untuk continuation recovery.
+        - 6.4B digunakan untuk reversal defense.
+        - Jika situasi belum jelas termasuk continuation atau reversal, default masuk WAIT & SEE.
 
       6.5 MANUVER REVERT KE LOCK NEUTRAL 1:1 (DARI 2:1)
       Jika struktur saat ini tidak seimbang (misal Long 2, Short 1) dan trend berbalik arah sebelum mencapai target BEP:
       - AKSI: REVERT KE 1:1 dengan cara MENUTUP POSISI EKSTRA (REDUCE leg yang dominan), BUKAN menambah posisi baru.
       - Tutup posisi ekstra tersebut TEPAT DI ATAS PROFIT (sedikit profit) untuk menutupi biaya trading dan memotong risiko floating lebih cepat.
       - Sisa posisi akan kembali menjadi LOCK NEUTRAL 1:1.
-      - Masuk ke mode WAIT & SEE tanpa tekanan MR, tunggu struktur market (Demand/Supply) dan trend baru untuk kembali melakukan ADD 0.5.
+      - Setelah itu:
+        - sisa posisi kembali menjadi LOCK NEUTRAL 1:1,
+        - masuk mode WAIT & SEE,
+        - tunggu struktur market (Demand / Supply),
+        - tunggu trend baru yang terkonfirmasi baca SECTION 2A – HIERARKI BACA TREND,
+        - baru pertimbangkan ADD 0.5 lagi secara konservatif jika valid.
 
       ============================================================
       SECTION 7 – EXPANSI KECIL (ADD 0.5) & STRUKTUR 2:1 (TRADING UTAMA)
@@ -1860,7 +1718,7 @@ async function monitorMarkets(force = false) {
               "stop_hedge_lock": number|null
             },
             "action_now": {
-              "action": "HOLD"|"REDUCE_LONG"|"REDUCE_SHORT"|"LOCK_NEUTRAL"|"UNLOCK"|"TAKE_PROFIT",
+              "action": "HOLD"|"REDUCE_LONG"|"REDUCE_SHORT"|"LOCK_NEUTRAL"|"UNLOCK"|"TAKE_PROFIT"|"ADD_LONG"|"ADD_SHORT",
               "percentage": number,
               "target_price": "Market"|number|null,
               "reason": "string <= 300 chars",
@@ -1871,8 +1729,8 @@ async function monitorMarkets(force = false) {
               "bep_price_if_2_to_1": number|null
             },
             "if_then": {
-              "if_price_up_to":   [ { "level": number, "do": "HOLD|TAKE_PROFIT|REDUCE_LONG|REDUCE_SHORT", "note":"<=120 chars" } ],
-              "if_price_down_to": [ { "level": number, "do": "HOLD|LOCK_NEUTRAL|REDUCE_LONG|REDUCE_SHORT", "note":"<=120 chars" } ]
+              "if_price_up_to":   [ { "level": number, "do": "HOLD|TAKE_PROFIT|REDUCE_LONG|REDUCE_SHORT|ADD_LONG|ADD_SHORT", "note":"<=120 chars" } ],
+              "if_price_down_to": [ { "level": number, "do": "HOLD|LOCK_NEUTRAL|REDUCE_LONG|REDUCE_SHORT|ADD_LONG|ADD_SHORT", "note":"<=120 chars" } ]
             },
             "buttons": {
               "show":  [ { "code":"RL|RS|LN|UL|HO|RR|AL|AS|HOLD|TP", "label":"string<=28" } ],
@@ -2189,403 +2047,7 @@ async function monitorMarkets(force = false) {
 // =========================================================
 // TELEGRAM HELPERS
 // =========================================================
-
-export function normalizeSymbolInput(rawSymbol?: string): string {
-    if (!rawSymbol) return "";
-    let s = rawSymbol.toUpperCase().trim();
-    // Remove any existing /USDT or USDT suffix to get the base
-    s = s.replace(/\/USDT$/, '').replace(/USDT$/, '').replace(/:USDT$/, '');
-    return `${s}/USDT`;
-}
-
-export function normalizeActionInput(rawAction: string): { action: string, extractedSymbol?: string, extractedPercentage?: number, extractedTargetPrice?: number, extractedQty?: number } {
-    let s = rawAction.toUpperCase().replace(/,/g, '.').replace(/\//g, ' ').trim();
-    
-    // 1. Extract percentage (e.g. "50%")
-    let extractedPercentage: number | undefined = undefined;
-    const pctMatch = s.match(/(\d+)%/);
-    if (pctMatch) {
-        extractedPercentage = parseInt(pctMatch[1], 10);
-        s = s.replace(/(\d+)%/, ' ').trim();
-    }
-
-    // 2. Extract targetPrice (decimal or 4+ digits)
-    let extractedTargetPrice: number | undefined = undefined;
-    const priceRegex = /(?:UP TO|AT|@|:)?\s*(\d+\.\d+|\d{4,})(?:\s|[:!,;]|$)?/i;
-    const priceMatch = s.match(priceRegex);
-    if (priceMatch) {
-        extractedTargetPrice = parseFloat(priceMatch[1]);
-        s = s.replace(priceRegex, ' ').trim();
-    }
-
-    // 3. Find Action
-    const aliasMap: Record<string, string> = {
-        'TAKE PROFIT': 'TP',
-        'TAKE_PROFIT': 'TP',
-        'REDUCE LONG': 'RL',
-        'REDUCE_LONG': 'RL',
-        'REDUCE SHORT': 'RS',
-        'REDUCE_SHORT': 'RS',
-        'ADD LONG': 'AL',
-        'ADD_LONG': 'AL',
-        'ADD SHORT': 'AS',
-        'ADD_SHORT': 'AS',
-        'HEDGE ON': 'HO',
-        'HEDGE_ON': 'HO',
-        'LOCK NEUTRAL': 'LN',
-        'LOCK_NEUTRAL': 'LN',
-        'UNLOCK': 'UL',
-        'ROLE': 'RR',
-        'HOLD': 'HOLD',
-        'BUY': 'AL',
-        'SELL': 'AS',
-        'TP': 'TP',
-        'RL': 'RL',
-        'RS': 'RS',
-        'AL': 'AL',
-        'AS': 'AS',
-        'HO': 'HO',
-        'LN': 'LN',
-        'UL': 'UL',
-        'RR': 'RR'
-    };
-
-    let action = "";
-    const sortedAliases = Object.keys(aliasMap).sort((a, b) => b.length - a.length);
-    for (const alias of sortedAliases) {
-        // Use word boundary to avoid matching inside other words (e.g., "AL" in "ANALISA")
-        const regex = new RegExp(`\\b${alias.replace(/ /g, '\\s+')}\\b`, 'i');
-        if (regex.test(s)) {
-            action = aliasMap[alias];
-            s = s.replace(regex, ' ').trim();
-            break;
-        }
-    }
-
-    // 4. Find Symbol (look for something like BTC/USDT or BTCUSDT)
-    let extractedSymbol: string | undefined = undefined;
-    const symbolMatch = s.match(/([A-Z0-9]{2,10}\/[A-Z0-9]{2,10}|[A-Z0-9]{5,15}USDT|[A-Z0-9]{2,10}:[A-Z0-9]{2,10})/);
-    if (symbolMatch) {
-        extractedSymbol = normalizeSymbolInput(symbolMatch[0]);
-        s = s.replace(symbolMatch[0], ' ').trim();
-    } else {
-        // Try simple 3-4 letter symbol if not found
-        const simpleSymbolMatch = s.match(/\b([A-Z]{3,5})\b/);
-        if (simpleSymbolMatch) {
-            extractedSymbol = normalizeSymbolInput(simpleSymbolMatch[1]);
-            s = s.replace(simpleSymbolMatch[1], ' ').trim();
-        }
-    }
-
-    // 5. Extract Quantity (number followed by symbol or just a number that isn't a percentage/price)
-    let extractedQty: number | undefined = undefined;
-    // Look for decimal or integer quantity
-    const qtyMatch = s.match(/(\d+\.\d+|\b\d+\b)/);
-    if (qtyMatch) {
-        const val = parseFloat(qtyMatch[1]);
-        // If it's not a common percentage, treat as absolute quantity
-        if (![10, 15, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 100].includes(val) || s.includes(qtyMatch[1] + ' ' + (extractedSymbol?.split('/')[0] || ''))) {
-            extractedQty = val;
-            s = s.replace(qtyMatch[1], ' ').trim();
-        }
-    }
-
-    // 6. If still no percentage, check if any remaining number looks like one
-    if (!extractedPercentage && !extractedQty) {
-        const numMatch = s.match(/(\d+)/);
-        if (numMatch) {
-            const val = parseInt(numMatch[1], 10);
-            if ([10, 15, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 100].includes(val)) {
-                extractedPercentage = val;
-            }
-        }
-    }
-
-    return { action, extractedSymbol, extractedPercentage, extractedTargetPrice, extractedQty };
-}
-
-export function buildCallbackData(params: { action: string, symbol: string, percentage?: number, targetPrice?: number, stopHedgePrice?: number }): string {
-    const a = params.action;
-    const s = normalizeSymbolInput(params.symbol); // Use full format
-    const pct = params.percentage || 100;
-    const tp = params.targetPrice ? params.targetPrice.toString() : '';
-    const sh = params.stopHedgePrice ? params.stopHedgePrice.toString() : '';
-    
-    return `a=${a}|s=${s}|pct=${pct}|tp=${tp}|sh=${sh}`;
-}
-
-export function parseTelegramCallbackData(data: string): { action?: string, symbol?: string, percentage?: number, targetPrice?: number, stopHedgePrice?: number } {
-    // Check if it's the new structured format
-    if (data.startsWith('a=')) {
-        const parts = data.split('|');
-        const result: any = {};
-        for (const part of parts) {
-            const [key, val] = part.split('=');
-            if (key === 'a') result.action = val;
-            if (key === 's') result.symbol = normalizeSymbolInput(val);
-            if (key === 'pct') result.percentage = parseInt(val, 10);
-            if (key === 'tp' && val) result.targetPrice = parseFloat(val);
-            if (key === 'sh' && val) result.stopHedgePrice = parseFloat(val);
-        }
-        return result;
-    }
-    
-    // Legacy format (e.g., "TP XRP", "a|s|p|tp|sh" from previous code)
-    if (data.includes('|')) {
-        // Old pipe format: "a|s|p|tp|sh"
-        const parts = data.split('|');
-        return {
-            action: parts[0],
-            symbol: normalizeSymbolInput(parts[1]),
-            percentage: parseInt(parts[2], 10) || 100,
-            targetPrice: parts[3] ? parseFloat(parts[3]) : undefined,
-            stopHedgePrice: parts[4] ? parseFloat(parts[4]) : undefined
-        };
-    }
-
-    // Very old text format: "TP XRP"
-    const norm = normalizeActionInput(data);
-    return {
-        action: norm.action,
-        symbol: norm.extractedSymbol,
-        percentage: norm.extractedPercentage || 100
-    };
-}
-
-function escapeHtml(t:any){ if(t==null) return ''; return t.toString()
-     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-     .replace(/"/g,'&quot;').replace(/'/g,'&#039;'); }
-
-function renderDecisionCardsToTelegram(cards: any[], server_enforce: any, global_guard: any, new_signals: any = null, archiveUrl?: string | null) {
-    const payloads = [];
-    
-    for (const card of cards) {
-        // 1) Normalisasi simbol tampilan
-        const viewSymbol = card.symbol.split(':')[0]; // e.g. BTC/USDT
-        const base = viewSymbol.split('/')[0]; // e.g. BTC
-        
-        // 2) Ambil stop-lock final per kartu
-        let stopLock = card.levels?.stop_hedge_lock;
-        if (server_enforce?.overrides) {
-            const override = server_enforce.overrides.find((o: any) => o.symbol === card.symbol || o.symbol === viewSymbol);
-            if (override && override.stop_hedge_lock_override !== undefined) {
-                stopLock = override.stop_hedge_lock_override;
-            }
-        }
-
-        // 3) Stempel waktu
-        const timestamp = card.telemetry?.generated_at || new Date().toISOString();
-
-        // 4) Ekonomi tombol (inline keyboard)
-        const inlineKeyboard = [];
-        if (card.buttons && card.buttons.show) {
-            const blockedCodes = new Set((card.buttons.block || []).map((b: any) => b.code));
-            
-            // Defense-in-depth: force block ADD/ROLE actions if GUARD_NO_ADD
-            if (global_guard?.mode === "GUARD_NO_ADD") {
-                ['AL', 'AS', 'HO', 'RR'].forEach(code => blockedCodes.add(code));
-            }
-
-            const allowedButtons = card.buttons.show.filter((btn: any) => !blockedCodes.has(btn.code));
-            
-            let currentRow = [];
-            for (const btn of allowedButtons) {
-                // mapping code → short action untuk callback
-                // callback_data format: "a|s|p|tp|sh"
-                const a = btn.code;
-                const s = base;
-                
-                // Extract params from action_now if it matches the button code
-                let p = 100;
-                let tp = '';
-                
-                const actionMap: Record<string, string> = {
-                    'RL': 'REDUCE_LONG', 'RS': 'REDUCE_SHORT', 'AL': 'ADD_LONG', 'AS': 'ADD_SHORT',
-                    'LN': 'LOCK_NEUTRAL', 'HO': 'HEDGE_ON', 'UL': 'UNLOCK', 'RR': 'ROLE', 'TP': 'TAKE_PROFIT', 'HOLD': 'HOLD'
-                };
-                const fullAction = actionMap[a] || a;
-
-                if (card.action_now && fullAction === card.action_now.action) {
-                    p = card.action_now.percentage || 100;
-                    tp = (card.action_now.target_price && card.action_now.target_price !== 'Market') ? card.action_now.target_price.toString() : '';
-                }
-                
-                // If tp is still empty, try to extract from if_then
-                if (!tp && card.if_then) {
-                    if (card.if_then.if_price_up_to && card.if_then.if_price_up_to.length > 0) {
-                        const up = card.if_then.if_price_up_to[0];
-                        if (up.do === fullAction) tp = up.level.toString();
-                    }
-                    if (!tp && card.if_then.if_price_down_to && card.if_then.if_price_down_to.length > 0) {
-                        const down = card.if_then.if_price_down_to[0];
-                        if (down.do === fullAction) tp = down.level.toString();
-                    }
-                }
-                
-                // Only attach stopHedgePrice to opening/locking actions
-                const openingActions = ['AL', 'AS', 'LN', 'HO', 'RR'];
-                const sh = (openingActions.includes(a) && stopLock !== null && stopLock !== undefined) ? stopLock.toString() : '';
-                
-                // User request: "semua harus berdasarkan STOP-LIMIT ataupun STOP_MARKET, Decision Card harus menyertakan harga target untuk eksekusi bila tidak jangan buat tombol action di telegram"
-                if (a !== 'HOLD' && !tp && !sh) {
-                    continue; // Skip rendering this button if no target price or stop price
-                }
-
-                const callback_data = buildCallbackData({
-                    action: a,
-                    symbol: s,
-                    percentage: p,
-                    targetPrice: tp ? parseFloat(tp) : undefined,
-                    stopHedgePrice: sh ? parseFloat(sh) : undefined
-                });
-                
-                currentRow.push({ text: btn.label, callback_data });
-                
-                // keyboard batching: maksimal 3 tombol per baris
-                if (currentRow.length >= 3) {
-                    inlineKeyboard.push(currentRow);
-                    currentRow = [];
-                }
-            }
-            if (currentRow.length > 0) {
-                inlineKeyboard.push(currentRow);
-            }
-        }
-
-        // 5) Pesan HTML
-        let message = `🛡️ <b>CRYPTO SENTINEL V2</b> 🛡️\n\n`;
-        message += `<b>${escapeHtml(viewSymbol)}</b>\n`;
-        message += `ℹ️ ${escapeHtml(card.status_line)}\n\n`;
-        
-        if (card.positions) {
-            const p = card.positions;
-            message += `📊 <b>Positions:</b>\n`;
-            if (p.long && p.long.qty > 0) {
-                const statusIcon = p.long.status === 'HIJAU' ? '🟢' : (p.long.status === 'MERAH' ? '🔴' : '⚪');
-                message += `Long: ${p.long.qty} @ ${p.long.entry} | PnL: ${p.long.pnl > 0 ? '+' : ''}${p.long.pnl} ${statusIcon}\n`;
-            }
-            if (p.short && p.short.qty > 0) {
-                const statusIcon = p.short.status === 'HIJAU' ? '🟢' : (p.short.status === 'MERAH' ? '🔴' : '⚪');
-                message += `Short: ${p.short.qty} @ ${p.short.entry} | PnL: ${p.short.pnl > 0 ? '+' : ''}${p.short.pnl} ${statusIcon}\n`;
-            }
-            if (p.ratio_hint) message += `Ratio Hint: ${escapeHtml(p.ratio_hint)}\n`;
-            message += `\n`;
-        }
-
-        if (card.levels) {
-            const l = card.levels;
-            message += `📐 <b>Levels:</b>\n`;
-            if (l.supply?.zone) message += `🔴 Supply: ${l.supply.zone[0]} - ${l.supply.zone[1]}\n`;
-            if (l.demand?.zone) message += `🟢 Demand: ${l.demand.zone[0]} - ${l.demand.zone[1]}\n`;
-            if (l.pivot) message += `📍 Pivot: ${l.pivot}\n`;
-            if (stopLock !== null && stopLock !== undefined) message += `🛑 STOP HEDGE: <b>${stopLock}</b>\n`;
-            message += `\n`;
-        }
-
-        if (card.action_now) {
-            const act = card.action_now;
-            let emoji = '✋';
-            if (act.action.includes('REDUCE') || act.action.includes('TAKE_PROFIT')) emoji = '✂️';
-            if (act.action.includes('ADD') || act.action === 'HEDGE_ON' || act.action === 'ROLE') emoji = '⚡';
-            if (act.action.includes('LOCK')) emoji = '🛡️';
-            if (act.action === 'UNLOCK') emoji = '🔓';
-            
-            message += `👉 <b>ACTION: ${emoji} ${act.action.replace('_', ' ')}</b>\n`;
-            message += `📝 ${escapeHtml(act.reason)}\n`;
-            if (act.mr_projected_if_action !== null && act.mr_projected_if_action !== undefined) {
-                message += `📈 MR Projected: ${act.mr_projected_if_action}%\n`;
-            }
-            if (act.bep_price_if_2_to_1 !== null && act.bep_price_if_2_to_1 !== undefined) {
-                message += `🎯 BEP (2:1): ${act.bep_price_if_2_to_1}\n`;
-            }
-            message += `\n`;
-        }
-
-        if (card.if_then) {
-            message += `🔮 <b>If/Then:</b>\n`;
-            if (card.if_then.if_price_up_to && card.if_then.if_price_up_to.length > 0) {
-                const up = card.if_then.if_price_up_to[0];
-                message += `⬆️ Up to ${up.level}: ${up.do} (${escapeHtml(up.note)})\n`;
-            }
-            if (card.if_then.if_price_down_to && card.if_then.if_price_down_to.length > 0) {
-                const down = card.if_then.if_price_down_to[0];
-                message += `⬇️ Down to ${down.level}: ${down.do} (${escapeHtml(down.note)})\n`;
-            }
-            message += `\n`;
-        }
-        
-        message += `⏱️ ${timestamp}`;
-
-        // 6) Return payload
-        const reply_markup = inlineKeyboard.length > 0 ? { inline_keyboard: inlineKeyboard } : undefined;
-        payloads.push({ text: message, reply_markup });
-    }
-    
-    // --- PART 2: NEW SIGNALS (TOP 20 SCANNER) ---
-    if (new_signals) {
-        let signalMsg = `📡 <b>TOP 20 SIGNAL SCANNER</b> 📡\n\n`;
-        
-        // MR Check
-        const mr = new_signals.mr;
-        if (mr) {
-             signalMsg += `MR: ${mr.value_pct}% (Limit: ${mr.limit_pct}%)\n`;
-             signalMsg += `Mode: <b>${mr.mode}</b>\n\n`;
-        }
-
-        // Risk Warning
-        if (new_signals.risk_warning) {
-            signalMsg += `⚠️ <b>RISK WARNING:</b>\n${escapeHtml(new_signals.risk_warning)}\n\n`;
-        }
-
-        // Active Signals
-        if (new_signals.signals && new_signals.signals.length > 0) {
-            signalMsg += `🎯 <b>NEW SIGNALS FOUND:</b>\n`;
-            for (const sig of new_signals.signals) {
-                const sideUpper = String(sig.side).toUpperCase();
-                const sideIcon = (sideUpper === 'BUY' || sideUpper === 'LONG') ? '🟢' : '🔴';
-                signalMsg += `${sideIcon} <b>${escapeHtml(sig.symbol)} (${sideUpper})</b>\n`;
-                signalMsg += `Entry: ${sig.entry}\n`;
-                signalMsg += `SL: ${sig.stop_loss}\n`;
-                signalMsg += `TP1: ${sig.targets.t1} (RR: ${sig.rr.t1_rr})\n`;
-                signalMsg += `TP2: ${sig.targets.t2} (RR: ${sig.rr.t2_rr})\n`;
-                
-                if (sig.sentiment) {
-                    const sentIcon = sig.sentiment.status === 'BULLISH' ? '📈' : (sig.sentiment.status === 'BEARISH' ? '📉' : '⚖️');
-                    signalMsg += `\n${sentIcon} <b>Sentiment: ${sig.sentiment.status} (${sig.sentiment.score_1_to_10}/10)</b>\n`;
-                    signalMsg += `<i>${escapeHtml(sig.sentiment.reason)}</i>\n`;
-                }
-
-                if (sig.confluence) {
-                    signalMsg += `\n<i>${escapeHtml(sig.confluence.notes)}</i>\n`;
-                }
-                signalMsg += `\n`;
-            }
-        } else {
-            signalMsg += `🚫 No high-quality signals found.\n\n`;
-        }
-
-        // Watchlist
-        if (new_signals.watchlist_candidates && new_signals.watchlist_candidates.length > 0) {
-            signalMsg += `👀 <b>WATCHLIST:</b>\n`;
-            for (const w of new_signals.watchlist_candidates) {
-                signalMsg += `• <b>${escapeHtml(w.symbol)}</b> (${w.bias_4h}): ${escapeHtml(w.notes)}\n`;
-            }
-        }
-
-        // Add as a separate message payload
-        payloads.push({
-            text: signalMsg,
-            reply_markup: undefined // No buttons for scanner results yet
-        });
-    }
-
-    // Attach archive URL ONLY to the very last message payload
-    if (archiveUrl && payloads.length > 0) {
-        payloads[payloads.length - 1].text += `\n\n🗂️ <b>Archive</b>: ${escapeHtml(archiveUrl)}`;
-    }
-
-    return payloads;
-}
+// Extracted to src/renderers/TelegramRenderer.ts
 
 // Paper Trading Engine Logic
 async function runPaperTradingEngine() {
@@ -2814,6 +2276,7 @@ async function runPaperTradingEngine() {
                 // Hedged Logic
                 
                 // A. Unlocking Logic (Close hedge if in profit and signal aligns)
+                // HANYA BOLEH UNLOCK (Tutup posisi hedge) JIKA POSISI HEDGE TERSEBUT SEDANG PROFIT.
                 if (signalSide === 'LONG' && shortPos.currentPnl > 0) {
                   const realized = shortPos.currentPnl;
                   await closePos(shortPos, 'Unlock (Hedge in Profit)');
@@ -2832,37 +2295,57 @@ async function runPaperTradingEngine() {
                   }
                 }
                 
-                // B. Revert to 1:1 Lock (Reduce Dominant Leg if trend reverses)
                 if (longPos && shortPos) {
-                  if (signalSide === 'SHORT' && longPos.size > shortPos.size) {
-                    const excessSize = longPos.size - shortPos.size;
-                    const excessPnl = (currentPrice - longPos.entryPrice) * excessSize;
-                    if (excessPnl > 0) {
-                      await partialClosePos(longPos, excessSize, 'Revert to 1:1 Lock (Excess in Profit)');
-                      longPos.realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + excessPnl;
-                      await setDoc(doc(db, 'paper_positions', longPos.id), { realizedHedgeProfit: longPos.realizedHedgeProfit }, { merge: true });
+                  const isLongProfit = longPos.currentPnl > 0;
+                  const isShortProfit = shortPos.currentPnl > 0;
+                  const isLongLoss = longPos.currentPnl < 0;
+                  const isShortLoss = shortPos.currentPnl < 0;
+                  
+                  const baseSize = Math.min(longPos.size, shortPos.size);
+                  const additionalSize = baseSize * 0.5;
+
+                  // B. Trend Reversal & Profit Taking (Salah Satu Leg Profit)
+                  // ATURAN MUTLAK: JANGAN PERNAH REDUCE/CUT LOSS PADA LEG MERAH. REDUCE HANYA PADA LEG HIJAU.
+                  if (signalSide === 'SHORT') { // Trend baru DOWN
+                    if (isLongProfit && isShortLoss && longPos.size > shortPos.size) {
+                      // Trend berbalik DOWN, LONG masih profit. REDUCE_LONG untuk amankan profit ke Lock 1:1.
+                      const excessSize = longPos.size - shortPos.size;
+                      const excessPnl = (currentPrice - longPos.entryPrice) * excessSize;
+                      if (excessPnl > 0) { // Pastikan bagian yang di-reduce profit
+                        await partialClosePos(longPos, excessSize, 'Reduce Long (Trend Reversed DOWN)');
+                        longPos.realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + excessPnl;
+                        await setDoc(doc(db, 'paper_positions', longPos.id), { realizedHedgeProfit: longPos.realizedHedgeProfit }, { merge: true });
+                      }
+                    } else if (isShortProfit && isLongLoss && setting.structure21Mode) {
+                      // Trend DOWN, SHORT profit. ADD_SHORT untuk struktur 2:1 (LONG 1, SHORT 2).
+                      if (shortPos.size < baseSize * 2) {
+                        await addSize(shortPos, additionalSize, `Add 0.5x to Short (Trend Continuation DOWN)`, freshSignal.id);
+                      }
                     }
-                  } else if (signalSide === 'LONG' && shortPos.size > longPos.size) {
-                    const excessSize = shortPos.size - longPos.size;
-                    const excessPnl = (shortPos.entryPrice - currentPrice) * excessSize;
-                    if (excessPnl > 0) {
-                      await partialClosePos(shortPos, excessSize, 'Revert to 1:1 Lock (Excess in Profit)');
-                      shortPos.realizedHedgeProfit = (shortPos.realizedHedgeProfit || 0) + excessPnl;
-                      await setDoc(doc(db, 'paper_positions', shortPos.id), { realizedHedgeProfit: shortPos.realizedHedgeProfit }, { merge: true });
+                  } else if (signalSide === 'LONG') { // Trend baru UP
+                    if (isShortProfit && isLongLoss && shortPos.size > longPos.size) {
+                      // Trend berbalik UP, SHORT masih profit. REDUCE_SHORT untuk amankan profit ke Lock 1:1.
+                      const excessSize = shortPos.size - longPos.size;
+                      const excessPnl = (shortPos.entryPrice - currentPrice) * excessSize;
+                      if (excessPnl > 0) { // Pastikan bagian yang di-reduce profit
+                        await partialClosePos(shortPos, excessSize, 'Reduce Short (Trend Reversed UP)');
+                        shortPos.realizedHedgeProfit = (shortPos.realizedHedgeProfit || 0) + excessPnl;
+                        await setDoc(doc(db, 'paper_positions', shortPos.id), { realizedHedgeProfit: shortPos.realizedHedgeProfit }, { merge: true });
+                      }
+                    } else if (isLongProfit && isShortLoss && setting.structure21Mode) {
+                      // Trend UP, LONG profit. ADD_LONG untuk struktur 2:1 (LONG 2, SHORT 1).
+                      if (longPos.size < baseSize * 2) {
+                        await addSize(longPos, additionalSize, `Add 0.5x to Long (Trend Continuation UP)`, freshSignal.id);
+                      }
                     }
                   }
-                }
-                
-                // C. Add 0.5 Mode (If both legs are red)
-                if (longPos && shortPos && setting.add05Mode) {
-                  if (longPos.currentPnl < 0 && shortPos.currentPnl < 0) {
-                    const baseSize = Math.min(longPos.size, shortPos.size);
-                    const additionalSize = baseSize * 0.5;
-                    
+
+                  // C. Add 0.5 Mode (Jika kedua leg merah)
+                  if (isLongLoss && isShortLoss && setting.add05Mode) {
                     if (signalSide === 'LONG' && longPos.size < baseSize * 2) {
-                      await addSize(longPos, additionalSize, `Add 0.5x to Long (Structure)`, freshSignal.id);
+                      await addSize(longPos, additionalSize, `Add 0.5x to Long (Recovery Mode)`, freshSignal.id);
                     } else if (signalSide === 'SHORT' && shortPos.size < baseSize * 2) {
-                      await addSize(shortPos, additionalSize, `Add 0.5x to Short (Structure)`, freshSignal.id);
+                      await addSize(shortPos, additionalSize, `Add 0.5x to Short (Recovery Mode)`, freshSignal.id);
                     }
                   }
                 }
@@ -3267,51 +2750,59 @@ app.post('/api/ai/optimize', async (req, res) => {
     }
 
     const prompt = `
-      You are an expert quantitative trader and AI trading strategist.
-      Analyze the following backtest results and provide actionable recommendations to optimize the trading strategy.
+      Anda adalah "Sentinel AI Optimizer" - pakar strategi trading kuantitatif yang mengkhususkan diri dalam optimasi parameter untuk sistem Sentinel HMM Regime Factor.
       
-      Backtest Parameters:
+      TUGAS ANDA:
+      Menganalisis hasil backtest dan menyarankan penyesuaian parameter numerik yang optimal untuk meningkatkan performa tanpa melanggar aturan struktural (SOP) Sentinel.
+
+      DATA BACKTEST:
       - Symbol: ${backtestResult.symbol}
       - Timeframe: ${backtestResult.timeframe}
       - Days: ${backtestResult.days}
-      
-      Settings Used for this Backtest:
-      - Take Profit: ${backtestResult.settings?.takeProfitPct || 4.0}%
-      - Lock 1:1 Mode: ${backtestResult.settings?.lock11Mode ? 'Enabled' : 'Disabled'}
-      - Lock Trigger: ${backtestResult.settings?.lockTriggerPct || 2.0}%
-      - Add 0.5 Mode: ${backtestResult.settings?.add05Mode ? 'Enabled' : 'Disabled'}
-      - Structure 2:1 Mode: ${backtestResult.settings?.structure21Mode ? 'Enabled' : 'Disabled'}
-      - Max MR (Margin Ratio): ${backtestResult.settings?.maxMrPct || 25.0}%
-      
-      Performance Summary:
-      - Initial Balance: $${backtestResult.summary.initialBalance.toFixed(2)}
-      - Final Balance: $${backtestResult.summary.finalBalance.toFixed(2)}
-      - Total Profit: $${backtestResult.summary.totalProfit.toFixed(2)} (${backtestResult.summary.profitPct.toFixed(2)}%)
-      - Total Trades: ${backtestResult.summary.totalTrades}
-      - Win Rate: ${backtestResult.summary.winRate.toFixed(2)}%
-      - Max Drawdown: ${backtestResult.summary.maxDrawdown.toFixed(2)}%
-      
-      Please provide:
-      1. A brief evaluation of the performance (e.g., is the drawdown acceptable for the return?).
-      2. Specific parameter adjustments to improve the strategy based on the **SOP UTAMA - TRADING SENTINEL** (e.g., Take Profit, Lock Trigger %, Max MR %, enabling/disabling Add 0.5 or Structure 2:1).
-      3. Any market regimes or conditions where this strategy might fail based on the data.
-      4. A final recommendation on whether this strategy is ready for live trading.
-      
-      PENTING: Strategi ini menggunakan HEDGING LOCK (Lock 1:1) dan SAMA SEKALI TIDAK MENGENAL CUT LOSS. JANGAN PERNAH menyarankan Cut Loss. Jelaskan bahwa jika ada loss yang terjadi di backtest, itu adalah hasil dari dinamika "Unlocking" (membuka kunci hedge saat trend berbalik) yang mungkin belum optimal, BUKAN karena cut loss. 
-      
-      ATURAN HEDGING YANG DIGUNAKAN ENGINE SAAT INI:
-      1. Engine HANYA akan menutup posisi hedge (unlock) apabila kondisi hedge tersebut sedang PROFIT.
-      2. Bila kondisi kedua leg (Long dan Short) sedang RED (floating loss), engine akan menggunakan fitur "Add 0.5" bertahap sesuai trend sampai struktur menjadi 2:1.
-      3. Engine akan melakukan EXIT CLOSE pada kedua kaki (Long dan Short) setelah menghitung BEP Profit + Fees, yaitu ketika leg yang dominan telah mengcover loss dari leg yang lebih kecil.
-      
-      Fokus pada optimasi parameter Hedging (Lock Trigger, Take Profit, Max MR) untuk meminimalisir Drawdown dan memaksimalkan efisiensi dari aturan hedging di atas.
-      
-      Format your response in Markdown. Keep it concise, analytical, and actionable. 
-      IMPORTANT: You MUST write your entire response in Indonesian (Bahasa Indonesia).
+      - Settings: ${JSON.stringify(backtestResult.settings)}
+      - Summary: ${JSON.stringify(backtestResult.summary)}
+
+      ATURAN STRUKTURAL (SOP) YANG TIDAK BOLEH DIUBAH:
+      1. NO CUT LOSS: Sistem Sentinel tidak mengenal cut loss. Semua risiko dikelola melalui Hedging Lock.
+      2. REDUCE HANYA PADA LEG HIJAU: Pengurangan posisi hanya boleh dilakukan pada leg yang sedang profit.
+      3. UNLOCK HANYA JIKA HEDGE LEG PROFIT: Membuka kunci hedge hanya boleh jika leg hedge tersebut sedang hijau.
+      4. NO EXPANSION IF AMBIGUOUS: Jangan menyarankan ekspansi (HEDGE_ON/ADD) jika trend tidak terkonfirmasi atau kondisi pasar ambigu (CHOP/REVERSAL_WATCH).
+      5. HARD GUARD MR: Margin Ratio (MR) tidak boleh melebihi 25%.
+
+      HASIL YANG DIHARAPKAN (JSON):
+      Anda harus merespons dalam format JSON yang valid dengan struktur berikut:
+      {
+        "assessment": "Evaluasi singkat performa strategi (Bahasa Indonesia).",
+        "parameter_changes": [
+          {
+            "parameter": "Nama parameter (misal: takeProfitPct, lockTriggerPct, maxMrPct)",
+            "current_value": nilai_saat_ini,
+            "suggested_value": nilai_saran,
+            "reason": "Alasan teknis penyesuaian (Bahasa Indonesia)."
+          }
+        ],
+        "regimes_to_avoid": ["Daftar kondisi pasar di mana strategi ini mungkin gagal"],
+        "live_readiness": "READY | CAUTION | NOT_READY",
+        "warnings": ["Daftar peringatan terkait risiko atau kepatuhan SOP"],
+        "structural_rules_respected": true
+      }
+
+      PENTING:
+      - Fokus HANYA pada parameter numerik.
+      - Jangan menyarankan perubahan pada logika inti SOP.
+      - Gunakan Bahasa Indonesia untuk semua penjelasan teks.
     `;
 
-    const aiResponse = await generateWithRetry(prompt, 'gemini-3.1-pro-preview');
-    res.json({ analysis: aiResponse });
+    const aiResponse = await generateWithRetry(prompt, 'gemini-3.1-pro-preview', 3, true);
+    
+    try {
+      const structuredResponse = JSON.parse(aiResponse);
+      res.json({ analysis: structuredResponse });
+    } catch (parseError) {
+      console.error("Failed to parse AI response as JSON:", aiResponse);
+      // Fallback to raw response if parsing fails
+      res.json({ analysis: { assessment: aiResponse, raw: true } });
+    }
   } catch (error: any) {
     console.error("AI Optimization Error:", error);
     res.status(500).json({ error: error.message });
@@ -3891,7 +3382,14 @@ async function generateAiReply(userMessage: string, chatId: string = 'default', 
     - HANYA BOLEH UNLOCK (Tutup posisi hedge) JIKA POSISI HEDGE TERSEBUT SEDANG PROFIT.
     - REVERT KE 1:1: Jika struktur 2:1 dan trend berbalik arah, AKSI ADALAH REDUCE POSISI EKSTRA (yang dominan) tepat di atas profit untuk kembali ke Lock Neutral 1:1 dan masuk mode Wait & See. JANGAN menambah posisi baru untuk me-lock.
     - Jika kedua leg merah: Tunggu konfirmasi trend baru, lalu ADD 0.5 bertahap searah trend baru pada pullback sampai struktur menjadi maksimal 2:1.
-    - Jika salah satu leg profit: Sisi profit dapat dipakai sebagai sumber dana recovery, sisi rugi diarahkan oleh trend baru.
+    - Jika salah satu leg profit:
+        - ATURAN MUTLAK: JANGAN PERNAH menyarankan REDUCE atau CUT LOSS pada leg yang sedang MERAH (Rugi). REDUCE HANYA BOLEH dilakukan pada leg yang sedang HIJAU (Profit).
+        - Jika trend baru DOWN:
+            • Jika SHORT profit & LONG rugi: Boleh REDUCE_SHORT sebagian untuk kunci profit ke posisi Lock 1:1 HANYA JIKA ada tanda reversal/pullback ke LONG dan trend berbalik kuat ke LONG, REDUCE_SHORT sampai batas entry SHORT dengan struktur 2:1 (LONG 2, SHORT 1). ATAU ADD_SHORT kecil di pullback trend searah SHORT sampai struktur 2:1 sesuai trend baru DOWN sampai target BEP lalu EXIT.
+            • Jika LONG profit & SHORT rugi: Boleh REDUCE_LONG untuk amankan profit ke posisi Lock 1:1, HANYA JIKA trend berbalik kuat ke DOWN, REDUCE_LONG sampai batas entry LONG dengan struktur 2:1 (LONG 1, SHORT 2).
+        - Jika trend baru UP:
+            • Jika LONG profit & SHORT rugi: Boleh REDUCE_LONG sebagian untuk kunci profit ke posisi Lock 1:1 HANYA JIKA ada tanda reversal/pullback ke DOWN/SHORT dan trend berbalik kuat ke DOWN, REDUCE_LONG sampai batas entry LONG dengan struktur 2:1 (LONG 1, SHORT 2). ATAU ADD_LONG kecil (add 0.5) sampai struktur 2:1 sesuai trend baru UP sampai target BEP lalu EXIT.
+            • Jika SHORT profit & LONG rugi: Boleh REDUCE_SHORT untuk amankan profit ke posisi Lock 1:1, HANYA JIKA trend berbalik kuat ke UP, REDUCE_SHORT sampai batas entry SHORT dengan struktur 2:1 (LONG 2, SHORT 1).
 
     SECTION 7 – EXPANSI KECIL (ADD 0.5) & STRUKTUR 2:1 (TRADING UTAMA)
     - Konsep 2:1 adalah strategi utama untuk pemulihan (Recovery). Ini melibatkan memiliki posisi di satu sisi (dominan) yang besarnya dua kali lipat dari sisi yang berlawanan (misal: 2 Long vs 1 Short).
@@ -5417,6 +4915,7 @@ async function checkRiskAndNotify() {
 
         PENTING: Pengguna saat ini menggunakan strategi "Hedging Recovery". 
         Artinya, floating minus yang sangat besar (bahkan ribuan persen) pada beberapa posisi mungkin disengaja sebagai bagian dari kuncian (hedging) untuk menjaga margin, BUKAN karena pengguna lupa cut loss.
+        ATURAN MUTLAK: JANGAN PERNAH menyarankan REDUCE atau CUT LOSS pada posisi yang sedang MERAH (Rugi/Floating Loss). REDUCE HANYA BOLEH dilakukan pada posisi yang sedang HIJAU (Profit).
         
         Tugas Anda:
         Buatlah pesan evaluasi singkat (maksimal 2 paragraf) untuk dikirim ke Telegram pengguna.

@@ -4,42 +4,21 @@ import {
 } from 'recharts';
 import { Play, TrendingUp, TrendingDown, History, BarChart2, AlertCircle, CheckCircle2, Loader2, RefreshCw, Brain } from 'lucide-react';
 import Markdown from 'react-markdown';
+import { BacktestResult } from '../types/backtest';
 
-interface BacktestResult {
-  symbol: string;
-  timeframe: string;
-  days: number;
-  settings?: {
-    takeProfitPct: number;
-    lock11Mode: boolean;
-    lockTriggerPct: number;
-    add05Mode: boolean;
-    structure21Mode: boolean;
-    maxMrPct: number;
-  };
-  summary: {
-    initialBalance: number;
-    finalBalance: number;
-    totalProfit: number;
-    profitPct: number;
-    totalTrades: number;
-    winRate: number;
-    maxDrawdown: number;
-  };
-  trades: {
-    type: string;
-    entryPrice: number;
-    entryTime: number;
-    exitPrice: number;
-    exitTime: number;
-    exitReason: string;
-    isHedged: boolean;
-    hedgeCount: number;
-    profit: number;
-    profitPct: number;
-    finalBalance: number;
+interface AIAnalysis {
+  assessment: string;
+  parameter_changes: {
+    parameter: string;
+    current_value: any;
+    suggested_value: any;
+    reason: string;
   }[];
-  equityCurve: any[];
+  regimes_to_avoid: string[];
+  live_readiness: 'READY' | 'CAUTION' | 'NOT_READY';
+  warnings: string[];
+  structural_rules_respected: boolean;
+  raw?: boolean;
 }
 
 const BacktestView: React.FC = () => {
@@ -55,7 +34,7 @@ const BacktestView: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
+  const [aiAnalysis, setAiAnalysis] = useState<AIAnalysis | string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -425,8 +404,114 @@ const BacktestView: React.FC = () => {
             </div>
             
             {aiAnalysis && (
-              <div className="bg-black/50 border border-indigo-500/10 rounded-xl p-6 prose prose-invert prose-indigo max-w-none prose-sm">
-                <Markdown>{aiAnalysis}</Markdown>
+              <div className="bg-black/50 border border-indigo-500/10 rounded-xl p-6">
+                {typeof aiAnalysis === 'string' ? (
+                  <div className="prose prose-invert prose-indigo max-w-none prose-sm">
+                    <Markdown>{aiAnalysis}</Markdown>
+                  </div>
+                ) : aiAnalysis.raw ? (
+                  <div className="prose prose-invert prose-indigo max-w-none prose-sm">
+                    <Markdown>{aiAnalysis.assessment}</Markdown>
+                  </div>
+                ) : (
+                  <div className="space-y-8">
+                    <div className="flex flex-col md:flex-row md:items-start justify-between gap-4">
+                      <div className="space-y-2">
+                        <h4 className="text-sm font-bold text-white uppercase tracking-wider">Market Assessment</h4>
+                        <p className="text-sm text-zinc-400 leading-relaxed">{aiAnalysis.assessment}</p>
+                      </div>
+                      <div className={`shrink-0 px-4 py-2 rounded-xl text-xs font-bold border flex items-center gap-2 ${
+                        aiAnalysis.live_readiness === 'READY' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' :
+                        aiAnalysis.live_readiness === 'CAUTION' ? 'bg-amber-500/10 text-amber-400 border-amber-500/30' :
+                        'bg-red-500/10 text-red-400 border-red-500/30'
+                      }`}>
+                        <div className={`w-2 h-2 rounded-full animate-pulse ${
+                          aiAnalysis.live_readiness === 'READY' ? 'bg-emerald-400' :
+                          aiAnalysis.live_readiness === 'CAUTION' ? 'bg-amber-400' :
+                          'bg-red-400'
+                        }`} />
+                        {aiAnalysis.live_readiness}
+                      </div>
+                    </div>
+
+                    {aiAnalysis.parameter_changes.length > 0 && (
+                      <div className="space-y-4">
+                        <h4 className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest flex items-center gap-2">
+                          <TrendingUp className="w-3 h-3" />
+                          Suggested Parameter Optimizations
+                        </h4>
+                        <div className="grid grid-cols-1 gap-3">
+                          {aiAnalysis.parameter_changes.map((change, idx) => (
+                            <div key={idx} className="bg-zinc-900/80 border border-white/5 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 group hover:border-indigo-500/30 transition-all">
+                              <div className="space-y-1">
+                                <p className="text-sm font-bold text-white">{change.parameter}</p>
+                                <p className="text-xs text-zinc-500">{change.reason}</p>
+                              </div>
+                              <div className="flex items-center gap-4">
+                                <div className="flex items-center gap-2 bg-black/40 px-3 py-1.5 rounded-xl border border-white/5">
+                                  <span className="text-xs text-zinc-500 line-through">{change.current_value}</span>
+                                  <span className="text-zinc-600">→</span>
+                                  <span className="text-sm text-emerald-400 font-bold">{change.suggested_value}</span>
+                                </div>
+                                <button 
+                                  onClick={() => {
+                                    if (change.parameter === 'takeProfitPct') setTakeProfitPct(change.suggested_value);
+                                    if (change.parameter === 'lockTriggerPct') setLockTriggerPct(change.suggested_value);
+                                    if (change.parameter === 'maxMrPct') setMaxMrPct(change.suggested_value);
+                                  }}
+                                  className="text-xs bg-indigo-500 hover:bg-indigo-400 text-white px-4 py-2 rounded-xl font-bold transition-all shadow-lg shadow-indigo-500/10"
+                                >
+                                  Apply
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                      {aiAnalysis.regimes_to_avoid.length > 0 && (
+                        <div className="space-y-4">
+                          <h4 className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest flex items-center gap-2">
+                            <AlertCircle className="w-3 h-3" />
+                            Regimes to Avoid
+                          </h4>
+                          <div className="flex flex-wrap gap-2">
+                            {aiAnalysis.regimes_to_avoid.map((regime, idx) => (
+                              <span key={idx} className="px-3 py-1.5 bg-red-500/5 border border-red-500/10 rounded-xl text-[10px] text-red-400/80 font-medium">
+                                {regime}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {aiAnalysis.warnings.length > 0 && (
+                        <div className="space-y-4">
+                          <h4 className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest flex items-center gap-2">
+                            <AlertCircle className="w-3 h-3 text-amber-500" />
+                            Critical Warnings
+                          </h4>
+                          <ul className="space-y-2">
+                            {aiAnalysis.warnings.map((warning, idx) => (
+                              <li key={idx} className="text-xs text-zinc-400 flex items-start gap-2">
+                                <span className="text-amber-500 mt-1">•</span>
+                                {warning}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                    
+                    {aiAnalysis.structural_rules_respected && (
+                      <div className="pt-4 border-t border-white/5 flex items-center gap-2 text-[10px] text-emerald-500/60 font-bold uppercase tracking-widest">
+                        <CheckCircle2 className="w-3 h-3" />
+                        Structural SOP Rules Validated & Respected
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
             {!aiAnalysis && !analyzing && (

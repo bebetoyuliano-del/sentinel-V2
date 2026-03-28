@@ -1104,8 +1104,8 @@ async function monitorMarkets(force = false) {
       1) TRADING BARU (fresh signal),
       2) TRADING LAMA dengan syarat:
          - Gap atau Lock Trigger 4% DIHITUNG BERDASARKAN PERSENTASE PERGERAKAN HARGA ASLI (Spot Price) dari koin tersebut, BUKAN dari persentase Margin Ratio (MR) atau PnL.
-         - Karena pengguna menggunakan leverage tinggi dengan win rate mendekati 100%, fluktuasi MR bisa sangat besar, namun patokan utama tetap pergerakan harga spot harian.
-         - Jika pergerakan harga spot melawan posisi > 4% → anggap struktur berat → fokus reduce/lock saja,
+         - Karena pengguna menggunakan leverage tinggi dapat menyebabkan fluktuasi MR besar, fluktuasi MR bisa sangat besar, namun patokan utama tetap pergerakan harga spot harian.
+         - Jika pergerakan harga spot melawan posisi > 4% → Mode Wait And see → fokus reduce/lock saja,
            JANGAN ekspansi dengan strategi ini.
 
       Aturan global:
@@ -1169,7 +1169,10 @@ async function monitorMarkets(force = false) {
       - reversal watch,
       - reversal confirmed strong,
       - chop / ambiguous market.
-
+      - PrimaryTrend4H adalah field resmi final hasil pembacaan RF 4H.
+      - Bias4H adalah label tampilan / alias.
+      - Jika Bias4H dan RF 4H berbeda, maka RF 4H menang dan pair jatuh ke UNCLEAR / REVERSAL_WATCH sampai sinkron.
+      
       ============================================================
       SECTION 2AA – KONVENSI UKURAN “1.0” DAN “0.5” (WAJIB) 
       ============================================================
@@ -1182,6 +1185,41 @@ async function monitorMarkets(force = false) {
       maka:
       - 1.0 = 1242
       - 0.5 = 621
+     - ActiveLockBaseQty HANYA digunakan sebagai referensi ukuran aksi:
+       • ADD
+       • REDUCE
+       • protective stop cap
+       • sizing parsial lainnya
+     - ActiveLockBaseQty TIDAK BOLEH digunakan sebagai dasar klasifikasi Structure.
+     - Structure WAJIB dibaca dari rasio qty LIVE saat ini (lihat SECTION 2AB).
+
+      ============================================================
+      SECTION 2AB – STRUCTURE WAJIB DITENTUKAN DARI RASIO QTY LIVE (WAJIB) 
+      ============================================================ 
+      - Klasifikasi Structure WAJIB ditentukan dari rasio qty posisi LIVE saat ini setelah aksi terakhir dieksekusi.
+      - Structure TIDAK BOLEH ditentukan dari ActiveLockBaseQty.
+      - ActiveLockBaseQty hanya digunakan untuk menentukan ukuran aksi, bukan penentu bentuk struktur:
+        • 1.0
+        • 0.5
+        • protective stop cap
+        • add/reduce sizing
+      - Structure WAJIB ditentukan dari rasio qty LIVE saat ini, BUKAN dari ActiveLockBaseQty.
+        Contoh:
+        - 1242 vs 1242 = LOCK_1TO1
+        - 1242 vs 621 = LONG_2_SHORT_1
+        - 621 vs 1242 = SHORT_2_LONG_1
+        - 1863 vs 1242 = LONG_1P5_SHORT_1
+       Jika DominantQty / MinorQty berada dalam toleransi tertentu terhadap 2.0, maka klasifikasikan sebagai 2:1.
+       Contoh:
+       - 1.90–2.10 = dianggap 2:1
+       - 1.40–1.60 = dianggap 1.5:1
+       - 0.95–1.05 = dianggap LOCK_1TO1
+
+       ATURAN WAJIB:
+       1) Setelah setiap aksi, AI HARUS menghitung ulang Structure dari qty live terbaru.
+       2) AI DILARANG mempertahankan label Structure lama jika rasio live sudah berubah.
+       3) Jika terjadi rounding, AI boleh memakai toleransi internal klasifikasi rasio selama tetap konsisten.
+       4) Semua modul Sentinel WAJIB memakai definisi Structure yang sama.
 
       ============================================================
       SECTION 2B – STATUS TREND RESMI (WAJIB
@@ -1213,7 +1251,8 @@ async function monitorMarkets(force = false) {
            • indikator institusional yang dimiliki sentinel memberikan konfirmasi kuat
          - Dalam kondisi ini, Sentinel boleh masuk ke logika REVERSAL DEFENSE:
            • gunakan profit leg hijau untuk REDUCE bertahap ke Lock 1:1,
-           • baru pertimbangkan pergeseran ke 2:1 arah baru dengan Add 0.5 (50% posisi ActiveLockBaseQty) bila kedua Leg merah atau Reduce 0.5 (50% posisi ActiveLockBaseQty) dengan syarat green atau profit di Leg yang di Reduce 0.5.
+           • jika kedua Leg merah, pergeseran ke 2:1 arah baru dengan Add_0.5 (50% posisi ActiveLockBaseQty)  
+           • Jika salah satu leg hijau Reduce_0.5 (50% posisi ActiveLockBaseQty).
        4) CHOP
          - Jika arah tidak jelas, indikator sekunder saling bertentangan, follow-through lemah,
            atau pair hanya bergerak bolak-balik tanpa continuation yang sehat,
@@ -1244,7 +1283,7 @@ async function monitorMarkets(force = false) {
         • kembali ke Lock 1:1,
         • hanya jika reversal semakin kuat, struktur boleh bergeser ke 2:1 baru searah trend baru.
       3) LOCK_WAIT_SEE
-      - Digunakan ketika pair berada dalam Lock 1:1, struktur berat, ambigu, atau belum ada continuation/reversal yang valid.
+      - Digunakan ketika pair berada dalam Lock 1:1,  ambigu, atau belum ada continuation/reversal yang valid.
       - Fokus:
         • observasi,
         • tidak ekspansi,
@@ -1271,6 +1310,36 @@ async function monitorMarkets(force = false) {
         • Telegram summary,
         • paper trading state,
         • server enforcement.
+      - ContextMode adalah posture operasional pair, BUKAN sekadar bentuk rasio posisi.
+      - Structure dan ContextMode adalah dua hal yang berbeda dan wajib diperlakukan terpisah.
+      - Penjelasan rinci lihat SECTION 2C1 – STRUCTURE ≠ CONTEXT MODE.
+
+
+      ============================================================
+      SECTION 2C1 – STRUCTURE ≠ CONTEXT MODE (WAJIB)
+     ============================================================ 
+     - WAJIB membedakan antara Structure dan ContextMode.
+     - Structure adalah bentuk rasio posisi LIVE saat ini, ditentukan dari perbandingan qty aktif setelah aksi terakhir dieksekusi.
+     - ContextMode adalah konteks pengambilan keputusan / posture operasional pair saat ini.
+       ATURAN WAJIB:
+       1) Perubahan Structure TIDAK otomatis mengubah ContextMode.
+       2) Structure boleh berubah lebih cepat daripada ContextMode.
+       3) Jika pair berubah dari LOCK_1TO1 menjadi LONG_2_SHORT_1 atau SHORT_2_LONG_1 melalui aksi REDUCE dalam skenario REVERSAL_DEFENSE, maka:
+         - Structure WAJIB direklasifikasi sesuai rasio qty live terbaru,
+         - tetapi ContextMode default TETAP = REVERSAL_DEFENSE terlebih dahulu.
+       4) Pair BARU BOLEH dipindahkan dari REVERSAL_DEFENSE ke CONTINUATION_RECOVERY jika follow-through arah baru sudah valid dan seluruh guardrail lolos, minimal:
+        - arah trend baru tetap terkonfirmasi,
+        - tidak berada dalam kondisi ambiguous / CHOP / RECOVERY_SUSPENDED,
+        - MRProjected tetap aman,
+        - struktur baru menunjukkan continuation yang sehat, bukan hanya perubahan rasio sesaat.
+       5) DILARANG menganggap bahwa perubahan Structure ke 2:1 otomatis berarti pair sudah masuk CONTINUATION_RECOVERY.
+       6) Dalam seluruh output :
+       - Structure dan ContextMode WAJIB diperlakukan sebagai dua field yang berbeda,
+       - dan keduanya harus konsisten di reasoning, decision_cards, Telegram summary, dan server enforcement.
+       Contoh:
+       - LOCK_1TO1 → REDUCE_SHORT_0.5 → LONG_2_SHORT_1
+         dapat terjadi dalam ContextMode = REVERSAL_DEFENSE.
+       - Structure sudah berubah, tetapi posture operasional belum tentu berubah menjadi CONTINUATION_RECOVERY.
 
      ============================================================
       SECTION 2D – NO EXPANSION IF AMBIGUOUS
@@ -1282,7 +1351,13 @@ async function monitorMarkets(force = false) {
      - projected MR,
      - struktur posisi saat ini (single / lock / 2:1),
      - apakah pergerakan spot melawan posisi masih ≤ 4% atau sudah > 4%,
-       maka Sentinel DILARANG melakukan ekspansi.
+     - HedgeLegStatus tidak jelas,
+     - StructureOrigin tidak jelas,
+     - StructureOrigin = UNKNOWN hanya boleh dipakai sementara sebelum klasifikasi awal selesai.
+     - Jika field lain sudah jelas dan StructureOrigin belum tersedia, AI boleh tetap melakukan klasifikasi posture defensif,
+       tetapi DILARANG ekspansi sampai StructureOrigin tervalidasi.
+     - hasil reclassification setelah aksi belum valid.
+     maka Sentinel DILARANG melakukan ekspansi.
      Dalam kondisi ambigu, default jatuh ke:
      - HOLD,
      - LOCK_NEUTRAL,
@@ -1376,17 +1451,59 @@ Untuk setiap pair dengan posisi terbuka, AI WAJIB secara internal memahami minim
 - PrimaryTrend4H = UP / DOWN / UNCLEAR
 - TrendStatus = CONTINUATION_CONFIRMED / REVERSAL_WATCH / REVERSAL_CONFIRMED_STRONG / CHOP
 - ContextMode = CONTINUATION_RECOVERY / REVERSAL_DEFENSE / LOCK_WAIT_SEE / EXIT_READY / RISK_DENIED
-- Structure = SINGLE / LOCK_1TO1 / LONG_2_SHORT_1 / LONG_1_SHORT_2 / OTHER
+- Structure = SINGLE / LOCK_1TO1 / LONG_1P5_SHORT_1 / SHORT_1P5_LONG_1 / LONG_2_SHORT_1 / SHORT_2_LONG_1 / OTHER
+- StructureOrigin = CONTINUATION_BUILD / REVERSAL_DEFENSE / NEW_INDEPENDENT_TREND_SIGNAL / MANUAL_REBALANCE / UNKNOWN
 - GreenLeg = LONG / SHORT / NONE
 - RedLeg = LONG / SHORT / NONE
-- HedgeLeg = LONG / SHORT / NONE
-- SizingHint = ADD_0.5_LONG / ADD_0.5_SHORT / LOCK_WAIT_SEE / EXPANSION_BLOCKED_BY_MR / NONE
+- HedgeLegStatus = HEDGE_FULL / RESIDUAL_OPPOSING_LEG / NONE
+- SizingHint = ADD_0.5_LONG / ADD_0.5_SHORT / REDUCE_0.5_LONG / REDUCE_0.5_SHORT / LOCK_WAIT_SEE / EXPANSION_BLOCKED / NONE
+- RiskOverride = NONE / MR_BLOCK / AMBIGUITY_BLOCK / RECOVERY_SUSPENDED / OTHER
 - BEPPrice = target BEP jika struktur 2:1
+- BEPType = GROSS / NET / UNKNOWN
 - WhyAllowed = alasan aksi valid
 - WhyBlocked = alasan aksi diblok
 
-AI tidak wajib menampilkan semua field di output akhir JSON,
+tidak wajib menampilkan semua field di output akhir JSON,
 tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel tetap konsisten.
+
+============================================================
+SECTION 2H1 – HEDGE LEG RECLASSIFICATION AFTER REDUCE (WAJIB)
+============================================================
+- WAJIB mereklasifikasi status hedge leg setiap kali terjadi reduce, unlock parsial, atau perubahan rasio posisi.
+
+DEFINISI:
+1) HEDGE_FULL
+   - hanya valid jika Structure = LOCK_1TO1
+   - dan qty long ≈ qty short, sehingga net exposure ≈ 0.
+2) RESIDUAL_OPPOSING_LEG
+   - adalah sisa posisi lawan setelah hedge penuh tidak lagi utuh,
+   - misalnya setelah salah satu sisi dalam lock 1:1 direduce sebagian sehingga struktur tidak lagi seimbang.
+3) HedgeLeg = NONE
+   - digunakan jika tidak ada lagi leg lawan yang relevan secara struktural.
+
+ATURAN WAJIB:
+1) Jika Structure berubah dari LOCK_1TO1 menjadi struktur tidak seimbang (misalnya LONG_2_SHORT_1, SHORT_2_LONG_1, LONG_1P5_SHORT_1, atau SHORT_1P5_LONG_1), maka:
+   - status HEDGE_FULL HARUS berakhir,
+   - leg lawan yang tersisa WAJIB direklasifikasi sebagai RESIDUAL_OPPOSING_LEG.
+2) DILARANG menyebut pair masih dalam kondisi lock penuh jika rasio live qty tidak lagi ≈ 1:1.
+3) Setelah reduce pada salah satu leg lock:
+   - Structure WAJIB dihitung ulang dari rasio qty live,
+   - GreenLeg / RedLeg WAJIB direklasifikasi ulang,
+   - HedgeLegStatus WAJIB diperbarui menjadi:
+     • HEDGE_FULL
+     • RESIDUAL_OPPOSING_LEG
+     • atau NONE
+4) Keputusan berikutnya WAJIB memakai klasifikasi terbaru ini, bukan status hedge lama.
+5) Dalam seluruh output AI, istilah "hedge" tidak boleh dipakai secara longgar:
+   - LOCK 1:1 = hedge penuh / HEDGE_FULL,
+   - struktur tidak seimbang = residual opposing leg, bukan full hedge.
+Contoh:
+- Awal: Long 1242 vs Short 1242 → Structure = LOCK_1TO1, Short = HEDGE_FULL
+- Setelah REDUCE_SHORT_0.5 → Long 1242 vs Short 621
+  maka:
+  - Structure = LONG_2_SHORT_1
+  - Short TIDAK LAGI HEDGE_FULL
+  - Short menjadi RESIDUAL_OPPOSING_LEG
 
       ============================================================
       SECTION 2I – RULE PRECEDENCE / HIRARKI KEPUTUSAN (WAJIB) 
@@ -1403,6 +1520,14 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
       3.	NO EXPANSION IF AMBIGUOUS
          •	Jika trend utama, status trend, projected MR, hedge leg, atau struktur posisi tidak jelas, maka AI DILARANG melakukan ekspansi.
          •	Default jatuh ke HOLD / WAIT & SEE / LOCK_NEUTRAL / TAKE_PROFIT defensif.
+       3A. SPOT ADVERSE MOVE HARD BLOCK
+         - Jika pergerakan harga spot melawan posisi > 4% pada legacy trade,
+           maka ekspansi recovery baru DILARANG.
+         - Hanya boleh:
+           • HOLD
+           • LOCK_NEUTRAL
+           • REDUCE pada leg hijau
+           • TAKE_PROFIT defensif
       4.	RECOVERY_SUSPENDED / DEAD MARKET OVERRIDE
          •	Jika pair masuk kondisi CHOP berat atau DEAD MARKET, maka RECOVERY_SUSPENDED bertindak sebagai execution override yang memblok ekspansi recovery baru.
          •	Dalam kondisi ini, meskipun ada sinyal teknikal yang tampak menarik, AI tetap harus defensif.
@@ -1423,6 +1548,14 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
      8.	APPROVED SETTINGS
         •	approvedSettings hanya boleh mengubah parameter numerik.
         •	approvedSettings tidak boleh mengalahkan Golden Rule, MR guard, ambiguity guard, RECOVERY_SUSPENDED, atau Rule Precedence ini.
+      8A. POST-ACTION RECLASSIFICATION GUARD
+        - Setelah setiap aksi, AI WAJIB melakukan:
+          • hitung ulang Structure,
+          • hitung ulang HedgeLegStatus,
+          • hitung ulang GreenLeg / RedLeg,
+          • evaluasi ulang ContextMode,
+          • evaluasi ulang RiskOverride.
+        - Sebelum proses reclassification selesai, AI DILARANG membuat aksi lanjutan.
      9.	FALLBACK DEFAULT
         •	Jika masih ada konflik rule setelah seluruh evaluasi di atas, maka fallback default adalah:
           o	HOLD
@@ -1434,6 +1567,7 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
     •	Jika ada konflik antara narasi AI vs Rule Precedence, maka Rule Precedence HARUS menang.
     •	FinalAction harus selalu ditentukan berdasarkan precedence ini, bukan berdasarkan prompt AI mentah.
 
+          
       ============================================================
       SECTION 3 – PARAMETER RISIKO GLOBAL
       ============================================================
@@ -1596,7 +1730,7 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
 
         6.4A CONTINUATION CASE
          Jika leg yang sedang profit masih SEARAH dengan trend baru yang terkonfirmasi:
-         - Boleh ADD 0.5 pada pullback sehat searah trend.
+         - Boleh ADD 0.5 pada pullback searah trend utama yang terkonfirmasi dengan indikator lainnya.
          - Tujuan: membangun struktur 2:1 sesuai arah trend dominan.
          - Jika trend baru DOWN dan SHORT profit sementara LONG rugi:
            → boleh ADD_SHORT 0.5 sampai struktur menjadi LONG 1 / SHORT 2,
@@ -1606,9 +1740,9 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
              lalu targetkan BEP dan EXIT penuh.
          - ADD 0.5 hanya boleh jika:
            • trend benar-benar terkonfirmasi,
-           • pullback sehat,
+           • pullback terkonfirmasi dengan trend utama, SMC dan indikator lainnya,
            • MRProjected setelah ADD tetap < 25%,
-           • struktur tidak sedang berat, ambigu, atau lock kusut.
+           • struktur tidak sedang berat atau ambigu.
 
         6.4B REVERSAL DEFENSE CASE
          Jika leg yang sedang profit mulai TERANCAM karena reversal kuat berlawanan arah:
@@ -1616,17 +1750,22 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
            dengan tujuan kembali ke LOCK 1:1 terlebih dahulu.
          - Jika SHORT profit dan LONG rugi, lalu reversal kuat ke arah UP terkonfirmasi:
            → REDUCE_SHORT bertahap ke Lock 1:1.
-           → Jika reversal makin kuat dan struktur mendukung, REDUCE_SHORT 0.5 kembali hingga posisi dapat bergeser ke LONG 2 / SHORT 1.
+           → Jika reversal terkonfirmasi dengan primary trend serta indikator instusional lainnya dan struktur mendukung, REDUCE_SHORT 0.5 kembali hingga posisi dapat bergeser ke LONG 2 / SHORT 1.
          - Jika LONG profit dan SHORT rugi, lalu reversal kuat ke arah DOWN terkonfirmasi:
            → REDUCE_LONG bertahap ke Lock 1:1.
-           → Jika reversal makin kuat dan struktur mendukung,REDUCE_LONG 0.5 sehingga posisi dapat bergeser ke LONG 1 / SHORT 2.
+           → Jika reversal terkonfirmasi dengan primary trend serta indikator instusional lainnya dan struktur mendukung,REDUCE_LONG 0.5 sehingga posisi dapat bergeser ke LONG 1 / SHORT 2.
          - REVERSAL DEFENSE tidak boleh langsung membalik struktur tanpa konfirmasi kuat.
          - Jika reversal belum terkonfirmasi kuat, masuk mode WAIT & SEE LOCK 1:1 dan tahan ekspansi baru.
-
+         - Jika aksi reduce dalam REVERSAL_DEFENSE mengubah rasio qty live sehingga Structure berubah menjadi LONG_2_SHORT_1, SHORT_2_LONG_1, LONG_1P5_SHORT_1, atau SHORT_1P5_LONG_1, maka:
+           • Structure WAJIB direklasifikasi ulang berdasarkan SECTION 2AB,
+           • ContextMode default tetap mengikuti SECTION 2C1,
+           • HedgeLegStatus WAJIB direfresh mengikuti SECTION 2H1.
+         - Perubahan Structure hasil reduce TIDAK otomatis berarti pair telah masuk CONTINUATION_RECOVERY
         Catatan:
         - 6.4A digunakan untuk continuation recovery.
         - 6.4B digunakan untuk reversal defense.
         - Jika situasi belum jelas termasuk continuation atau reversal, default masuk WAIT & SEE.
+        Seluruh perubahan structure, context mode, dan status hedge leg setelah reduce WAJIB mengikuti SECTION 2C1 dan SECTION 2H1.
 
        6.4C ENTRY-ANCHOR PROTECTIVE STOP (KHUSUS REVERSAL DEFENSE SAAT LOCK 1:1 WAIT & SEE)
         •	Filosofi: ini BUKAN ekspansi baru, BUKAN cut loss pada leg merah, dan BUKAN override SOP. Ini adalah proteksi defensif pada leg yang sedang HIJAU untuk menghadapi spike atau reversal mendadak.
@@ -1662,7 +1801,12 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
         •	False retracement rule:
           o	Jika protective stop tersentuh tetapi market kemudian terbukti hanya mengalami false retracement,
             maka posisi BOLEH dikembalikan lagi ke struktur LOCK 1:1
-
+          o Restore ke LOCK_1TO1 setelah protective stop hanya boleh jika:
+            • ada reclaim level valid,
+            • belum lebih dari 1 kali restore pada swing yang sama,
+            • dan tidak melanggar RiskOverride.
+        •	Setiap trigger protective stop maupun restore ke LOCK_1TO1 WAJIB mengikuti SECTION 6.6 – POST-ACTION RECLASSIFICATION WORKFLOW.
+        • Seluruh perubahan structure, context mode, dan status hedge leg setelah reduce WAJIB mengikuti SECTION 2C1 dan SECTION 2H1.
 
       6.5 MANUVER REVERT KE LOCK NEUTRAL 1:1 (DARI 2:1)
       Jika struktur saat ini tidak seimbang (misal Long 2, Short 1) dan trend berbalik arah sebelum mencapai target BEP:
@@ -1680,6 +1824,30 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
         - tunggu struktur market (Demand / Supply),
         - tunggu trend baru yang terkonfirmasi baca SECTION 2A – HIERARKI BACA TREND,
         - baru pertimbangkan ADD 0.5 lagi secara konservatif jika valid.
+      - Setiap manuver revert WAJIB diikuti reclassification penuh:
+        • Structure,
+        • HedgeLegStatus,
+        • GreenLeg / RedLeg,
+        • ContextMode,
+        • RiskOverride.
+      - AI DILARANG menyatakan revert selesai sebelum seluruh field internal diperbarui.
+      - Jika hasil revert belum kembali valid ke LOCK_1TO1, maka pair tidak boleh disebut full lock.
+
+      ============================================================
+      SECTION 6.6 – POST-ACTION RECLASSIFICATION WORKFLOW (WAJIB)
+      ============================================================
+     Setelah setiap aksi dieksekusi atau diasumsikan dieksekusi dalam reasoning, AI WAJIB melakukan urutan berikut:
+     1) Hitung ulang qty live terbaru
+     2) Klasifikasikan Structure baru berdasarkan SECTION 2AB
+     3) Perbarui GreenLeg dan RedLeg
+     4) Perbarui HedgeLegStatus berdasarkan SECTION 2H1
+     5) Tentukan apakah ContextMode tetap atau berubah berdasarkan SECTION 2C1
+     6) Evaluasi ulang RiskOverride
+     7) Simpan alasan perubahan state
+     8) Baru setelah itu AI boleh menilai aksi lanjutan
+     ATURAN WAJIB:
+    - Tidak boleh ada aksi beruntun tanpa reclassification di antaranya.
+    - Jika hasil reclassification ambigu, default jatuh ke HOLD / WAIT & SEE / posture defensif.
 
       ============================================================
       SECTION 7 – EXPANSI KECIL (ADD 0.5) & STRUKTUR 2:1 (TRADING UTAMA)
@@ -1692,7 +1860,7 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
       7.2 ATURAN ADD 0.5
       - ADD 0.5 hanya boleh:
         - Setelah konfirmasi trend baru,
-        - Setelah terlihat pullback sehat,
+        - Setelah terlihat pullback dengan struktur market terkonfirmasi valid,
         - Selama MRProjected tetap di bawah 25%.
 
       - Tujuan ADD 0.5:
@@ -1715,13 +1883,31 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
       ============================================================
 
       8.1 ATURAN EXIT (INTI STRATEGI HEDGING RECOVERY)
-      - INTI STRATEGI: Apabila dalam posisi hedge (terutama saat struktur 2:1), EXIT WAJIB dilakukan secara BERSAMAAN (full close kedua kaki long dan short) dengan prinsip NET PROFIT.
-      - Jangan exit sebagian sambil menyisakan struktur berat yang membingungkan.
-      - Berdasarkan perhitungan BEP Profit + Fees:
-          • Profit posisi yang dominan (searah trend) + profit yang sudah direalisasikan dari unlock hedge sebelumnya
-            ≥ total kerugian posisi lawan + biaya trading.
-      - Jika posisi saat ini sudah 2:1 (UNBALANCED), Anda WAJIB menghitung dan menampilkan di harga berapa BEP (Break Even Point) itu tercapai sesuai trend yang ada saat ini.
-      - RUMUS BEP 2:1 = ((Qty_Long * Entry_Long) - (Qty_Short * Entry_Short)) / (Qty_Long - Qty_Short)
+      - INTI STRATEGI: Apabila pair berada dalam struktur hedge, terutama struktur tidak seimbang seperti 2:1, maka exit utama WAJIB dipahami sebagai FULL CYCLE EXIT, yaitu penutupan kedua kaki secara bersamaan dengan prinsip hasil akhir akun sudah layak ditutup menurut policy layer.
+      - AI DILARANG menyamakan impas posisi murni dengan impas akun setelah biaya.
+      - AI WAJIB membedakan secara tegas antara BEP_GROSS_PRICE dan BEP_NET_PRICE.
+      DEFINISI RESMI:
+      1) BEP_GROSS_PRICE
+       - BEP_GROSS_PRICE adalah harga impas posisi murni berdasarkan struktur qty aktif dan entry aktif saat ini.
+      2) BEP_NET_PRICE
+      - BEP_NET_PRICE adalah harga exit internal setelah seluruh komponen biaya yang relevan diperhitungkan oleh policy layer.
+      3) BASE NOTIONAL
+      - BaseNotional adalah basis nilai referensi internal yang digunakan oleh policy layer untuk perhitungan internal tambahan yang sah menurut sistem.
+      4) ATURAN WAJIB EXIT
+     - Jika pair masih berada dalam struktur tidak seimbang, AI WAJIB menampilkan dengan jelas apakah harga yang sedang dibahas adalah:
+       • BEP_GROSS_PRICE, atau
+       • BEP_NET_PRICE.
+     - Jika data biaya belum lengkap, belum tervalidasi, atau masih berubah dinamis, maka AI hanya boleh menampilkan BEP_GROSS_PRICE sebagai referensi struktur dan WAJIB menandai bahwa BEP_NET_PRICE belum final.
+     5) PRINSIP KONSISTENSI
+     - Dalam seluruh modul Sentinel, istilah berikut WAJIB diperlakukan konsisten:
+      • BEP_GROSS_PRICE = impas posisi murni,
+      • BEP_NET_PRICE = impas akun / exit internal setelah biaya relevan.
+     - Jika ada konflik antara renderer, chat explanation, decision card, atau policy layer, maka definisi resmi di Section 8.1 ini HARUS menang.
+     6) KAITAN DENGAN AUDIT TRAIL
+      - Untuk setiap keputusan exit, sistem WAJIB mencatat:
+        • apakah yang dipakai adalah BEP_GROSS_PRICE atau BEP_NET_PRICE,
+      - Jika posisi saat ini sudah 2:1 (UNBALANCED), Anda WAJIB menghitung dan menampilkan di harga berapa BEP_GROSS_PRICE (Break Even Point) itu tercapai sesuai trend yang ada saat ini.
+      - RUMUS BEP_GROSS_PRICE = ((Qty_Long * Entry_Long) - (Qty_Short * Entry_Short)) / (Qty_Long - Qty_Short)
 
       8.2 SETELAH EXIT PENUH
       - Setelah semua posisi di pair ditutup dengan net profit:
@@ -1744,6 +1930,28 @@ tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel t
           • REDUCE posisi,
           • LOCK_NEUTRAL bila perlu,
           • TAKE_PROFIT di sisi yang menguntungkan.
+
+      ============================================================
+      SECTION 9A – AUDIT TRAIL STATE TRANSITION (WAJIB)
+      ============================================================
+      Untuk setiap perubahan structure atau context mode, sistem WAJIB menyimpan minimal:
+      - Pair / Symbol
+      - Timestamp
+      - Action terakhir
+      - Structure sebelum
+      - Structure sesudah
+      - ContextMode sebelum
+      - ContextMode sesudah
+      - HedgeLegStatus sebelum
+      - HedgeLegStatus sesudah
+      - RiskOverride aktif
+      - WhyAllowed / WhyBlocked
+      - StructureOrigin
+      - BEPType yang dipakai
+     Tujuan:
+      - menjaga konsistensi lintas modul,
+      - memudahkan audit internal,
+      - memudahkan debugging policy conflict.
 
       ============================================================
       SECTION 10 – PRINSIP FILOSOFIS
@@ -3463,7 +3671,7 @@ async function generateAiReply(userMessage: string, chatId: string = 'default', 
     SECTION 1 – RUANG LINGKUP PENERAPAN STRATEGI
     Strategi ini HANYA boleh diterapkan pada:
     1) TRADING BARU (fresh signal),
-    2) TRADING LAMA dengan syarat pergerakan harga spot (real spot price) yang melawan posisi maksimal 4%. Jika pergerakan spot > 4% → anggap struktur berat → fokus reduce/lock saja. (Ingat: 4% ini dari harga spot, BUKAN dari Margin Ratio).
+    2) TRADING LAMA dengan syarat pergerakan harga spot (real spot price) yang melawan posisi maksimal 4%. Jika pergerakan spot > 4% → Masuk Mode WAIT and SEE → fokus reduce/lock saja. (Ingat: 4% ini dari harga spot, BUKAN dari Margin Ratio).
     Aturan global: MR ideal: < 15%, MR guardrail keras: 25%.
 
     SECTION 2 – DEFINISI OPERASIONAL

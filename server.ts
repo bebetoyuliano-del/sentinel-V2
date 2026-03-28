@@ -10,7 +10,7 @@ import { createServer as createViteServer } from 'vite';
 import { RSI, MACD, EMA, BollingerBands, SMA } from 'technicalindicators';
 import { Storage } from '@google-cloud/storage';
 import { initializeApp } from 'firebase/app';
-import { initializeFirestore, doc, setDoc, getDoc, collection, query, orderBy, limit, getDocs, serverTimestamp, setLogLevel, deleteDoc, where } from 'firebase/firestore';
+import { initializeFirestore, doc, setDoc, getDoc, collection, query, orderBy, limit, getDocs, serverTimestamp, setLogLevel, deleteDoc, where, writeBatch } from 'firebase/firestore';
 import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword } from 'firebase/auth';
 import fs from 'fs';
 import path from 'path';
@@ -88,6 +88,8 @@ let cachedPaperPositions: any[] = [];
 let cachedPaperWallet: any = { balance: 10000, equity: 10000, freeMargin: 10000, updatedAt: new Date().toISOString() };
 let cachedPaperHistory: any[] = [];
 let cachedPaperMonitoring: any[] = [];
+let cachedTradingJournal: any[] = [];
+let cachedChats: any[] = [];
 let isRealtimeListenersSetup = false;
 let lastDbSyncTime = 0;
 
@@ -122,6 +124,27 @@ function setupRealtimeListeners() {
       cachedPaperHistory = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     }, (error) => {
       console.error("Error in paper_history snapshot:", error);
+    });
+
+    const journalQuery = query(collection(db, 'trading_journal'), orderBy('timestamp', 'desc'), limit(100));
+    onSnapshot(journalQuery, (snap) => {
+      cachedTradingJournal = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    }, (error) => {
+      console.error("Error in trading_journal snapshot:", error);
+    });
+
+    const signalsQuery = query(collection(db, 'signals'), orderBy('timestamp', 'desc'), limit(100));
+    onSnapshot(signalsQuery, (snap) => {
+      signals = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    }, (error) => {
+      console.error("Error in signals snapshot:", error);
+    });
+
+    const chatsQuery = query(collection(db, 'chats'), orderBy('timestamp', 'asc'), limit(100));
+    onSnapshot(chatsQuery, (snap) => {
+      cachedChats = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    }, (error) => {
+      console.error("Error in chats snapshot:", error);
     });
 
     // Removed paper_monitoring onSnapshot to save reads. We will maintain this purely in memory.
@@ -538,6 +561,7 @@ let monitorInterval: NodeJS.Timeout | null = null;
 let isPaperTradingRunning = false;
 let paperTradingInterval: NodeJS.Timeout | null = null;
 let latestDecisionCards: any[] = [];
+let paperTradingResetTime = 0;
 
 // Helper to send Telegram message
 // Extracted to src/services/TelegramService.ts
@@ -1061,7 +1085,7 @@ async function monitorMarkets(force = false) {
       - Fokus utama Anda saat ini adalah: **HEDGING RECOVERY BY ZONE**.
       - Anda juga memiliki akses ke 'recentBacktests' yang berisi hasil backtest terbaru. Gunakan data ini untuk mengoptimalkan strategi trading Anda (misalnya, menyesuaikan stop loss, take profit, atau menghindari pair dengan win rate rendah).
       - **PENTING (APPROVED SETTINGS)**: Jika ada data di dalam array 'approvedSettings' untuk koin tertentu, Anda **WAJIB** menggunakan parameter tersebut (seperti Take Profit, Lock Trigger, Max MR, dll) sebagai pengganti nilai default di SOP Utama khusus untuk koin tersebut. Ini adalah hasil backtest yang sudah dioptimalkan dan disetujui oleh user.
-      - **PENTING (SIGNALS)**: Jika Anda melihat peluang trading pada koin yang ada di 'approvedSettingsSymbols', Anda **SANGAT DISARANKAN** untuk memberikan sinyal trading di bagian 'new_signals'. Sinyal ini akan digunakan oleh bot Paper Trading untuk mengeksekusi perdagangan secara otomatis.
+      - **PENTING (SIGNALS)**: Jika Anda melihat peluang trading yang kuat pada koin mana pun di 'scannerUniverse' (Top 20), Anda **SANGAT DISARANKAN** untuk memberikan sinyal trading di bagian 'new_signals'. Sinyal ini akan digunakan oleh bot Paper Trading untuk mengeksekusi perdagangan secara otomatis.
       - **PENTING (SAME PAIR SIGNALS)**: Jika Anda memberikan sinyal baru untuk koin yang **SUDAH MEMILIKI POSISI TERBUKA** (lihat 'accountPositions'), Anda **WAJIB** memberikan penjelasan di bagian 'why_this_pair' apakah ini adalah:
         1. **Sinyal Baru**: Sinyal independen baru (misal: pembalikan arah atau trend baru).
         2. **Strategi ADD 0.5**: Bagian dari SOP main trading utama untuk memperkuat posisi yang sudah ada atau melakukan recovery (misal: menambah 0.5 lot di pullback).
@@ -1263,7 +1287,8 @@ async function monitorMarkets(force = false) {
            • LOCK_NEUTRAL,
            • TAKE_PROFIT defensif,
            • REDUCE pada leg hijau bila valid.
-
+        
+        Pelaksanaan teknis wajib mengikuti Section 6.3 / 6.4B / 6.6 dan Rule Precedence.
      ============================================================
       SECTION 2C – CONTEXT MODE RESMI (WAJIB)
      ============================================================ 
@@ -1566,7 +1591,13 @@ Contoh:
     •	Seluruh engine, policy layer, prompt AI, renderer, dan chat explanation WAJIB mengikuti Rule Precedence ini.
     •	Jika ada konflik antara narasi AI vs Rule Precedence, maka Rule Precedence HARUS menang.
     •	FinalAction harus selalu ditentukan berdasarkan precedence ini, bukan berdasarkan prompt AI mentah.
-
+   
+   Jika bingung, baca urutannya begini:
+   - Jangan sentuh leg merah
+   - Cek MR >25? kalau ya, jangan ekspansi
+   - Cek adverse spot >4% atau market ambigu? kalau ya, defensif
+   - Baru lihat continuation vs reversal
+   - Setelah aksi, wajib reclassify”
           
       ============================================================
       SECTION 3 – PARAMETER RISIKO GLOBAL
@@ -1811,7 +1842,10 @@ Contoh:
       6.5 MANUVER REVERT KE LOCK NEUTRAL 1:1 (DARI 2:1)
       Jika struktur saat ini tidak seimbang (misal Long 2, Short 1) dan trend berbalik arah sebelum mencapai target BEP:
       - AKSI: REVERT KE 1:1 dengan cara MENUTUP POSISI EKSTRA (REDUCE leg yang profit atau green), BUKAN menambah posisi baru.
-      - Tutup posisi ekstra tersebut TEPAT DI ATAS entry Leg yang PROFIT (sedikit profit) untuk menutupi biaya trading dan memotong risiko floating lebih cepat.
+      - Tutup posisi ekstra tersebut  di area profit tipis relatif terhadap entry leg yang sedang hijau, dengan arah yang sesuai jenis posisinya:
+        • LONG profit → sedikit di atas entry
+        • SHORT profit → sedikit di bawah entry
+        Tujuannya menutup biaya trading dan menormalkan exposure.
       - Sisa posisi akan kembali menjadi LOCK NEUTRAL 1:1.
       •	Tujuan revert ke 1:1:
         o	menghindari floating loss berlebihan pada salah satu leg,
@@ -2380,20 +2414,84 @@ async function runPaperTradingEngine() {
     const walletRef = doc(db, 'paper_wallet', 'main');
     let wallet = { ...cachedPaperWallet };
 
-    // 2. Fetch Approved Settings
-    const approvedSettings = [...cachedApprovedSettings];
+    // 2. Fetch Open Positions
+    const openPositions = [...cachedPaperPositions];
 
-    if (approvedSettings.length === 0) {
-      console.log('[PAPER] No approved settings found. Skipping cycle.');
+    // 3. Determine symbols to process
+    const freshSignals = signals.filter(s => 
+      s.type === 'scanner_signal' &&
+      (Date.now() - new Date(s.timestamp).getTime() < 20 * 60 * 1000) &&
+      new Date(s.timestamp).getTime() > paperTradingResetTime
+    );
+
+    const symbolsToProcess = Array.from(new Set([
+      ...openPositions.map(p => p.symbol),
+      ...freshSignals.map(s => s.symbol)
+    ])).filter(Boolean);
+
+    if (symbolsToProcess.length === 0) {
+      console.log('[PAPER] No open positions or fresh signals. Skipping cycle.');
       return;
     }
 
-    // 3. Fetch Open Positions
-    const openPositions = [...cachedPaperPositions];
+    // Recalculate equity and free margin to fix any inconsistencies
+    let totalUnrealized = 0;
+    let totalMarginUsed = 0;
+    const LEVERAGE = 20; // Default leverage for paper trading
+    for (const pos of openPositions) {
+      if (pos.status === 'OPEN') {
+        totalMarginUsed += (pos.size * pos.entryPrice) / LEVERAGE;
+        totalUnrealized += pos.unrealizedPnl || 0;
+      }
+    }
+    wallet.equity = wallet.balance + totalUnrealized;
+    wallet.freeMargin = wallet.equity - totalMarginUsed;
+    wallet.marginRatio = wallet.equity > 0 ? (totalMarginUsed / wallet.equity) * 100 : 0;
+    await setDoc(walletRef, wallet);
 
-    // 4. Process each approved setting
-    for (const setting of approvedSettings) {
-      const { symbol, timeframe, takeProfitPct } = setting;
+    // Liquidation Check
+    if (wallet.equity <= 0 && openPositions.length > 0) {
+      console.log(`[PAPER] 🚨 LIQUIDATION TRIGGERED! Equity is ${wallet.equity}`);
+      for (const pos of openPositions) {
+        if (pos.status === 'OPEN') {
+          await setDoc(doc(db, 'paper_history', pos.id), {
+            ...pos, exitPrice: pos.currentPrice || pos.entryPrice, pnl: pos.unrealizedPnl, reason: 'LIQUIDATION', closedAt: new Date().toISOString(), status: 'CLOSED'
+          });
+          if (pos.journalId) {
+            await setDoc(doc(db, 'trading_journal', pos.journalId), {
+              exitPrice: pos.currentPrice || pos.entryPrice, pnl: pos.unrealizedPnl, status: 'CLOSED', closedAt: new Date().toISOString(), closeReason: 'LIQUIDATION'
+            }, { merge: true });
+          }
+          await deleteDoc(doc(db, 'paper_positions', pos.id));
+        }
+      }
+      wallet.balance = 0;
+      wallet.equity = 0;
+      wallet.freeMargin = 0;
+      wallet.updatedAt = new Date().toISOString();
+      await setDoc(walletRef, wallet);
+      await sendTelegramMessage(`[PAPER] 🚨 <b>LIQUIDATION ALERT</b>\nYour paper trading account has been liquidated due to negative equity.`);
+      return; // Stop processing this cycle
+    }
+
+    // 4. Process each symbol
+    for (const symbol of symbolsToProcess) {
+      if (!symbol || typeof symbol !== 'string') continue;
+      
+      // Use approved settings if available, otherwise use defaults
+      const approvedSetting = cachedApprovedSettings.find(s => s.symbol === symbol);
+      const setting = approvedSetting || {
+        symbol,
+        timeframe: '4h',
+        takeProfitPct: 4.0,
+        lock11Mode: true,
+        lockTriggerPct: 2.0,
+        add05Mode: true,
+        structure21Mode: false,
+        maxMrPct: 25.0
+      };
+      
+      const { timeframe, takeProfitPct } = setting;
       
       try {
         // Fetch current price (lightweight)
@@ -2409,7 +2507,8 @@ async function runPaperTradingEngine() {
         const freshSignal = signals.find(s => 
           s.symbol === symbol && 
           s.type === 'scanner_signal' &&
-          (Date.now() - new Date(s.timestamp).getTime() < 20 * 60 * 1000)
+          (Date.now() - new Date(s.timestamp).getTime() < 20 * 60 * 1000) &&
+          new Date(s.timestamp).getTime() > paperTradingResetTime
         );
 
         // Calculate PnL
@@ -2425,6 +2524,23 @@ async function runPaperTradingEngine() {
           totalUnrealizedPnl += shortPos.currentPnl;
         }
 
+        // Helper to update wallet state accurately
+        const updateWalletState = async () => {
+          let totalUnrealized = 0;
+          let totalMarginUsed = 0;
+          for (const p of openPositions) {
+            if (p.status === 'OPEN') {
+              totalUnrealized += p.currentPnl !== undefined ? p.currentPnl : (p.unrealizedPnl || 0);
+              totalMarginUsed += (p.size * p.entryPrice) / LEVERAGE;
+            }
+          }
+          wallet.equity = wallet.balance + totalUnrealized;
+          wallet.freeMargin = wallet.equity - totalMarginUsed;
+          wallet.marginRatio = wallet.equity > 0 ? (totalMarginUsed / wallet.equity) * 100 : 0;
+          wallet.updatedAt = new Date().toISOString();
+          await setDoc(walletRef, wallet);
+        };
+
         // Helper to close position
         const closePos = async (pos: any, reason: string) => {
           await setDoc(doc(db, 'paper_history', pos.id), {
@@ -2436,17 +2552,12 @@ async function runPaperTradingEngine() {
             }, { merge: true });
           }
           await deleteDoc(doc(db, 'paper_positions', pos.id));
+          
+          const index = openPositions.findIndex(p => p.id === pos.id);
+          if (index > -1) openPositions[index].status = 'CLOSED';
+          
           wallet.balance += pos.currentPnl;
-          
-          // Recalculate equity
-          let remainingUnrealized = 0;
-          if (longPos && longPos.id !== pos.id) remainingUnrealized += longPos.currentPnl;
-          if (shortPos && shortPos.id !== pos.id) remainingUnrealized += shortPos.currentPnl;
-          wallet.equity = wallet.balance + remainingUnrealized;
-          
-          wallet.freeMargin += (pos.size * pos.entryPrice) + pos.currentPnl;
-          wallet.updatedAt = new Date().toISOString();
-          await setDoc(walletRef, wallet);
+          await updateWalletState();
           await sendTelegramMessage(`[PAPER] 💰 <b>Closed ${pos.side} ${symbol}</b>\nReason: ${reason}\nPnL: $${pos.currentPnl.toFixed(2)}`);
         };
 
@@ -2464,44 +2575,59 @@ async function runPaperTradingEngine() {
           pos.currentPnl -= realizedPnl;
           await setDoc(doc(db, 'paper_positions', pos.id), { size: pos.size, unrealizedPnl: pos.currentPnl }, { merge: true });
           
+          const index = openPositions.findIndex(p => p.id === pos.id);
+          if (index > -1) {
+            openPositions[index].size = pos.size;
+            openPositions[index].currentPnl = pos.currentPnl;
+          }
+          
           wallet.balance += realizedPnl;
-          
-          // Recalculate equity
-          let remainingUnrealized = 0;
-          if (longPos) remainingUnrealized += longPos.currentPnl;
-          if (shortPos) remainingUnrealized += shortPos.currentPnl;
-          wallet.equity = wallet.balance + remainingUnrealized;
-          
-          wallet.freeMargin += (sizeToClose * pos.entryPrice) + realizedPnl;
-          wallet.updatedAt = new Date().toISOString();
-          await setDoc(walletRef, wallet);
+          await updateWalletState();
           await sendTelegramMessage(`[PAPER] 💰 <b>Partial Close ${pos.side} ${symbol}</b>\nReason: ${reason}\nPnL: $${realizedPnl.toFixed(2)}`);
         };
 
         // Helper to open position
-        const openPos = async (side: string, size: number, reason: string, signalId: string = '') => {
+        const openPos = async (side: string, size: number, reason: string, signalId: string = '', signalData: any = null) => {
           const newPosRef = doc(collection(db, 'paper_positions'));
           const journalId = `journal_${Date.now()}_${symbol.replace('/', '')}`;
+          
+          // Use signal targets if available, otherwise fallback to percentage (for safety)
+          let tpPrice = 0;
+          let slPrice = 0;
+          
+          if (signalData && signalData.targets) {
+            // Use T2 as final Take Profit, T1 can be used for partials/locks
+            tpPrice = signalData.targets.t2 || signalData.targets.t1 || 0;
+            slPrice = signalData.stop_loss || 0;
+          }
+          
+          if (tpPrice === 0) {
+            tpPrice = side === 'LONG' ? currentPrice * (1 + takeProfitPct/100) : currentPrice * (1 - takeProfitPct/100);
+          }
+
           const journalEntry = {
             id: journalId, timestamp: new Date().toISOString(), symbol, side, entryPrice: currentPrice,
-            stopLoss: 0, target1: 0, target2: 0, reason, sentiment: 'NEUTRAL', status: 'OPEN', source: 'PAPER_BOT', pnl: 0
+            stopLoss: slPrice, target1: signalData?.targets?.t1 || 0, target2: tpPrice, reason, sentiment: signalData?.sentiment || 'NEUTRAL', status: 'OPEN', source: 'PAPER_BOT', pnl: 0
           };
           await setDoc(doc(db, 'trading_journal', journalId), journalEntry);
 
           const newPos = {
             id: newPosRef.id, symbol, side, entryPrice: currentPrice, size, unrealizedPnl: 0,
-            takeProfit: side === 'LONG' ? currentPrice * (1 + takeProfitPct/100) : currentPrice * (1 - takeProfitPct/100),
-            stopLoss: 0, status: 'OPEN', openedAt: new Date().toISOString(), signalId, journalId,
+            takeProfit: tpPrice,
+            stopLoss: slPrice, 
+            target1: signalData?.targets?.t1 || 0,
+            status: 'OPEN', openedAt: new Date().toISOString(), signalId, journalId,
             isHedge: reason.includes('Lock') || reason.includes('Hedge'),
             realizedHedgeProfit: 0
           };
           await setDoc(newPosRef, newPos);
           
-          wallet.freeMargin -= (size * currentPrice);
-          wallet.updatedAt = new Date().toISOString();
-          await setDoc(walletRef, wallet);
-          await sendTelegramMessage(`[PAPER] 🟢 <b>Opened ${side} ${symbol}</b>\nReason: ${reason}\nEntry: $${currentPrice.toFixed(4)}\nSize: ${size.toFixed(4)}`);
-          return { ...newPos, currentPnl: 0, pnlPct: 0 };
+          const posWithPnl = { ...newPos, currentPnl: 0, pnlPct: 0 };
+          openPositions.push(posWithPnl);
+          await updateWalletState();
+          
+          await sendTelegramMessage(`[PAPER] 🟢 <b>Opened ${side} ${symbol}</b>\nReason: ${reason}\nEntry: $${currentPrice.toFixed(4)}\nTP: $${tpPrice.toFixed(4)}\nSL: $${slPrice.toFixed(4)}`);
+          return posWithPnl;
         };
 
         // Helper to add size to position
@@ -2513,58 +2639,75 @@ async function runPaperTradingEngine() {
             size: newTotalSize, entryPrice: newAvgEntry, lastSignalId: signalId
           }, { merge: true });
 
-          wallet.freeMargin -= (additionalSize * currentPrice);
-          wallet.updatedAt = new Date().toISOString();
-          await setDoc(walletRef, wallet);
-          await sendTelegramMessage(`[PAPER] ➕ <b>Added to ${pos.side} ${symbol}</b>\nReason: ${reason}\nNew Avg Entry: $${newAvgEntry.toFixed(4)}\nNew Size: ${newTotalSize.toFixed(4)}`);
-          
           pos.size = newTotalSize;
           pos.entryPrice = newAvgEntry;
           pos.lastSignalId = signalId;
+          
+          const index = openPositions.findIndex(p => p.id === pos.id);
+          if (index > -1) {
+            openPositions[index].size = newTotalSize;
+            openPositions[index].entryPrice = newAvgEntry;
+          }
+          
+          await updateWalletState();
+          await sendTelegramMessage(`[PAPER] ➕ <b>Added to ${pos.side} ${symbol}</b>\nReason: ${reason}\nNew Avg Entry: $${newAvgEntry.toFixed(4)}\nNew Size: ${newTotalSize.toFixed(4)}`);
         };
 
-        // --- 1. EXIT LOGIC ---
+        // --- 1. EXIT LOGIC (Sentinel Targets) ---
         if (longPos && shortPos) {
           const primaryPos = longPos.openedAt < shortPos.openedAt ? longPos : shortPos;
-          const targetNetProfit = (primaryPos.size * primaryPos.entryPrice) * (takeProfitPct / 100);
           
           const realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + (shortPos.realizedHedgeProfit || 0);
           const totalNetProfit = totalUnrealizedPnl + realizedHedgeProfit;
           
-          // Exit both legs if total net profit covers losses + fees (BEP + small profit)
-          // We use targetNetProfit * 0.25 as a small buffer for BEP to ensure fees are covered
-          const bepTarget = targetNetProfit * 0.25;
-          if (totalNetProfit >= bepTarget && totalNetProfit > 0) {
+          // Exit hedge if total net profit is positive (BEP+)
+          if (totalNetProfit > 0) {
             await closePos(longPos, 'Net Take Profit (Hedge Resolved)');
             await closePos(shortPos, 'Net Take Profit (Hedge Resolved)');
             longPos = undefined; shortPos = undefined;
           }
         } else {
           if (longPos) {
-            const targetProfit = (longPos.size * longPos.entryPrice) * (takeProfitPct / 100);
-            const totalNetProfit = longPos.currentPnl + (longPos.realizedHedgeProfit || 0);
-            if (totalNetProfit >= targetProfit && totalNetProfit > 0) {
-              await closePos(longPos, 'Take Profit');
+            const isAtTP = currentPrice >= longPos.takeProfit;
+            // Only exit on SL if lock11Mode is disabled. If enabled, we hedge instead.
+            const isAtSL = !setting.lock11Mode && longPos.stopLoss > 0 && currentPrice <= longPos.stopLoss;
+            
+            if (isAtTP) {
+              await closePos(longPos, 'Take Profit (Sentinel Target)');
+              longPos = undefined;
+            } else if (isAtSL) {
+              await closePos(longPos, 'Stop Loss (Sentinel Target)');
               longPos = undefined;
             }
           }
           if (shortPos) {
-            const targetProfit = (shortPos.size * shortPos.entryPrice) * (takeProfitPct / 100);
-            const totalNetProfit = shortPos.currentPnl + (shortPos.realizedHedgeProfit || 0);
-            if (totalNetProfit >= targetProfit && totalNetProfit > 0) {
-              await closePos(shortPos, 'Take Profit');
+            const isAtTP = currentPrice <= shortPos.takeProfit;
+            // Only exit on SL if lock11Mode is disabled. If enabled, we hedge instead.
+            const isAtSL = !setting.lock11Mode && shortPos.stopLoss > 0 && currentPrice >= shortPos.stopLoss;
+            
+            if (isAtTP) {
+              await closePos(shortPos, 'Take Profit (Sentinel Target)');
+              shortPos = undefined;
+            } else if (isAtSL) {
+              await closePos(shortPos, 'Stop Loss (Sentinel Target)');
               shortPos = undefined;
             }
           }
         }
 
-        // --- 2. HEDGE LOGIC (LOCK 1:1) ---
-        const lockTrigger = setting.lockTriggerPct || 2.0;
+        // --- 2. HEDGE LOGIC (LOCK 1:1 - Based on Sentinel SL/Structure) ---
         if (setting.lock11Mode) {
-          if (longPos && !shortPos && longPos.pnlPct <= -lockTrigger) {
-            shortPos = await openPos('SHORT', longPos.size, 'Lock 1:1 (Hedge)', 'HEDGE_TRIGGER');
-          } else if (shortPos && !longPos && shortPos.pnlPct <= -lockTrigger) {
-            longPos = await openPos('LONG', shortPos.size, 'Lock 1:1 (Hedge)', 'HEDGE_TRIGGER');
+          // Trigger hedge if price hits Stop Loss level instead of fixed %
+          if (longPos && !shortPos) {
+            const triggerHedge = longPos.stopLoss > 0 ? (currentPrice <= longPos.stopLoss) : (longPos.pnlPct <= -2.0);
+            if (triggerHedge) {
+              shortPos = await openPos('SHORT', longPos.size, 'Lock 1:1 (Sentinel SL Trigger)', 'HEDGE_TRIGGER');
+            }
+          } else if (shortPos && !longPos) {
+            const triggerHedge = shortPos.stopLoss > 0 ? (currentPrice >= shortPos.stopLoss) : (shortPos.pnlPct <= -2.0);
+            if (triggerHedge) {
+              longPos = await openPos('LONG', shortPos.size, 'Lock 1:1 (Sentinel SL Trigger)', 'HEDGE_TRIGGER');
+            }
           }
         }
 
@@ -2580,16 +2723,20 @@ async function runPaperTradingEngine() {
               
               if (!longPos && !shortPos) {
                 // New Entry
-                const entryMultiplier = setting.structure21Mode ? 2.0 : 1.0;
-                let size = (wallet.balance / currentPrice) * entryMultiplier;
-                
-                // Limit entry size based on maxMrPct
-                const maxAllowedSize = (wallet.balance * ((setting.maxMrPct || 25.0) / 100)) / currentPrice;
-                if (size > maxAllowedSize) size = maxAllowedSize;
-                
-                if (size * currentPrice > 10) { // Minimum trade size check
-                  if (signalSide === 'LONG') longPos = await openPos('LONG', size, 'AI Signal Entry', freshSignal.id);
-                  else shortPos = await openPos('SHORT', size, 'AI Signal Entry', freshSignal.id);
+                if (wallet.freeMargin <= 0 || wallet.balance <= 0) {
+                  console.log(`[PAPER] Insufficient free margin to open new position for ${symbol}`);
+                } else {
+                  const entryMultiplier = setting.structure21Mode ? 2.0 : 1.0;
+                  let size = (wallet.balance / currentPrice) * entryMultiplier;
+                  
+                  // Limit entry size based on maxMrPct
+                  const maxAllowedSize = (wallet.balance * ((setting.maxMrPct || 25.0) / 100)) / currentPrice;
+                  if (size > maxAllowedSize) size = maxAllowedSize;
+                  
+                  if (size * currentPrice > 10) { // Minimum trade size check
+                    if (signalSide === 'LONG') longPos = await openPos('LONG', size, 'AI Signal Entry', freshSignal.id, freshSignal);
+                    else shortPos = await openPos('SHORT', size, 'AI Signal Entry', freshSignal.id, freshSignal);
+                  }
                 }
               } else if (longPos && shortPos) {
                 // Hedged Logic
@@ -2637,7 +2784,7 @@ async function runPaperTradingEngine() {
                       }
                     } else if (isShortProfit && isLongLoss && setting.structure21Mode) {
                       // Trend DOWN, SHORT profit. ADD_SHORT untuk struktur 2:1 (LONG 1, SHORT 2).
-                      if (shortPos.size < baseSize * 2) {
+                      if (shortPos.size < baseSize * 2 && wallet.freeMargin > 0) {
                         await addSize(shortPos, additionalSize, `Add 0.5x to Short (Trend Continuation DOWN)`, freshSignal.id);
                       }
                     }
@@ -2653,14 +2800,14 @@ async function runPaperTradingEngine() {
                       }
                     } else if (isLongProfit && isShortLoss && setting.structure21Mode) {
                       // Trend UP, LONG profit. ADD_LONG untuk struktur 2:1 (LONG 2, SHORT 1).
-                      if (longPos.size < baseSize * 2) {
+                      if (longPos.size < baseSize * 2 && wallet.freeMargin > 0) {
                         await addSize(longPos, additionalSize, `Add 0.5x to Long (Trend Continuation UP)`, freshSignal.id);
                       }
                     }
                   }
 
                   // C. Add 0.5 Mode (Jika kedua leg merah)
-                  if (isLongLoss && isShortLoss && setting.add05Mode) {
+                  if (isLongLoss && isShortLoss && setting.add05Mode && wallet.freeMargin > 0) {
                     if (signalSide === 'LONG' && longPos.size < baseSize * 2) {
                       await addSize(longPos, additionalSize, `Add 0.5x to Long (Recovery Mode)`, freshSignal.id);
                     } else if (signalSide === 'SHORT' && shortPos.size < baseSize * 2) {
@@ -2693,7 +2840,9 @@ async function runPaperTradingEngine() {
           const pos = longPos || shortPos;
           const realizedHedgeProfit = pos.realizedHedgeProfit || 0;
           const totalNetProfit = pos.currentPnl + realizedHedgeProfit;
-          plan = `Monitoring ${pos.side} for TP (+${takeProfitPct}%). Net PnL: $${totalNetProfit.toFixed(2)}. Lock Trigger: -${lockTrigger}%.`;
+          const tpPrice = pos.takeProfit || 0;
+          const slPrice = pos.stopLoss || 0;
+          plan = `Monitoring ${pos.side} for Sentinel TP ($${tpPrice.toFixed(2)}). Net PnL: $${totalNetProfit.toFixed(2)}. SL: $${slPrice.toFixed(2)}.`;
         }
         
         const monitorId = symbol.replace('/', '_');
@@ -2710,6 +2859,10 @@ async function runPaperTradingEngine() {
         console.error(`[PAPER] Error processing ${symbol}:`, err);
       }
     }
+
+    // Clean up monitoring cache for symbols no longer being processed
+    cachedPaperMonitoring = cachedPaperMonitoring.filter(m => symbolsToProcess.includes(m.symbol));
+
   } catch (error) {
     console.error('[PAPER] Engine Error:', error);
   }
@@ -3287,17 +3440,7 @@ app.get('/api/debug-env', (req, res) => {
 });
 
 app.get('/api/journal', async (req, res) => {
-  if (!db) {
-    return res.status(500).json({ error: 'Firestore not initialized' });
-  }
-  try {
-    const q = query(collection(db, 'trading_journal'), orderBy('timestamp', 'desc'), limit(100));
-    const snapshot = await getDocs(q);
-    const journal = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    res.json({ journal });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
+  res.json({ journal: cachedTradingJournal });
 });
 
 app.post('/api/journal/sync', async (req, res) => {
@@ -3360,6 +3503,56 @@ app.post('/api/journal/sync', async (req, res) => {
   } catch (error: any) {
     console.error('Error syncing journal:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/paper/reset', async (req, res) => {
+  try {
+    // Stop engine if running
+    if (isPaperTradingRunning) {
+      if (paperTradingInterval) clearInterval(paperTradingInterval);
+      isPaperTradingRunning = false;
+    }
+
+    // 1. Reset Wallet
+    const walletRef = doc(db, 'paper_wallet', 'main');
+    await setDoc(walletRef, {
+      balance: 10000,
+      equity: 10000,
+      freeMargin: 10000,
+      updatedAt: new Date().toISOString()
+    });
+
+    // 2. Delete all paper_positions
+    const posSnapshot = await getDocs(collection(db, 'paper_positions'));
+    const posBatch = writeBatch(db);
+    posSnapshot.docs.forEach(d => posBatch.delete(d.ref));
+    await posBatch.commit();
+
+    // 3. Delete all paper_history
+    const histSnapshot = await getDocs(collection(db, 'paper_history'));
+    const histBatch = writeBatch(db);
+    histSnapshot.docs.forEach(d => histBatch.delete(d.ref));
+    await histBatch.commit();
+
+    // 4. Delete all trading_journal from PAPER_BOT
+    const journalSnapshot = await getDocs(query(collection(db, 'trading_journal'), where('source', '==', 'PAPER_BOT')));
+    const journalBatch = writeBatch(db);
+    journalSnapshot.docs.forEach(d => journalBatch.delete(d.ref));
+    await journalBatch.commit();
+
+    // Clear caches
+    cachedPaperPositions = [];
+    cachedPaperHistory = [];
+    cachedPaperMonitoring = [];
+    cachedPaperWallet = { balance: 10000, equity: 10000, freeMargin: 10000, updatedAt: new Date().toISOString() };
+    paperTradingResetTime = Date.now();
+
+    await sendTelegramMessage(`[PAPER] 🔄 <b>Account Reset</b>\nPaper trading account has been reset to $10,000.`);
+
+    res.json({ success: true, message: 'Paper trading account reset to $10,000' });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Failed to reset paper trading' });
   }
 });
 
@@ -3454,6 +3647,10 @@ app.post('/api/bot/force-run', (req, res) => {
 
 app.get('/api/signals', (req, res) => {
   res.json(signals);
+});
+
+app.get('/api/chats', (req, res) => {
+  res.json(cachedChats);
 });
 
 // Helper to fetch account risk data

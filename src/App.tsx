@@ -113,6 +113,7 @@ export default function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [appError, setAppError] = useState<Error | null>(null);
   const [isOfflineMode, setIsOfflineMode] = useState(false);
+  const [syncMessage, setSyncMessage] = useState<{text: string, type: 'success' | 'error'} | null>(null);
 
   if (appError) {
     throw appError;
@@ -120,18 +121,20 @@ export default function App() {
 
   const handleSync = async () => {
     setIsSyncing(true);
+    setSyncMessage(null);
     try {
       const res = await fetch('/api/journal/sync', { method: 'POST' });
       const data = await res.json();
       if (data.success) {
-        alert(`Successfully synced ${data.syncedCount} trades from Binance.`);
+        setSyncMessage({ text: `Successfully synced ${data.syncedCount} trades from Binance.`, type: 'success' });
       } else {
-        alert(`Failed to sync: ${data.error}`);
+        setSyncMessage({ text: `Failed to sync: ${data.error}`, type: 'error' });
       }
     } catch (err: any) {
-      alert(`Error syncing: ${err.message}`);
+      setSyncMessage({ text: `Error syncing: ${err.message}`, type: 'error' });
     } finally {
       setIsSyncing(false);
+      setTimeout(() => setSyncMessage(null), 5000);
     }
   };
 
@@ -182,111 +185,57 @@ export default function App() {
   useEffect(() => {
     if (!user) return;
     
-    if (isOfflineMode) {
-      // Fetch signals from API instead
-      const fetchSignals = async () => {
-        try {
-          const res = await fetch('/api/signals');
-          if (res.ok) {
-            const data = await res.json();
-            setSignals(data);
-          }
-        } catch (e) {
-          console.error("Error fetching signals in offline mode", e);
+    // Fetch signals from API
+    const fetchSignals = async () => {
+      try {
+        const res = await fetch('/api/signals');
+        if (res.ok) {
+          const data = await res.json();
+          setSignals(data);
         }
-      };
-      
-      const fetchJournal = async () => {
-        try {
-          const res = await fetch('/api/journal');
-          if (res.ok) {
-            const data = await res.json();
-            setJournal(data.journal || []);
-          }
-        } catch (e) {
-          console.error("Error fetching journal in offline mode", e);
+      } catch (e) {
+        console.error("Error fetching signals", e);
+      }
+    };
+    
+    // Fetch journal from API
+    const fetchJournal = async () => {
+      try {
+        const res = await fetch('/api/journal');
+        if (res.ok) {
+          const data = await res.json();
+          setJournal(data.journal || []);
         }
-      };
+      } catch (e) {
+        console.error("Error fetching journal", e);
+      }
+    };
 
+    // Fetch chats from API
+    const fetchChats = async () => {
+      try {
+        const res = await fetch('/api/chats');
+        if (res.ok) {
+          const data = await res.json();
+          setChatMessages(data.map((c: any) => ({ role: c.role, content: c.content })));
+        }
+      } catch (e) {
+        console.error("Error fetching chats", e);
+      }
+    };
+
+    fetchSignals();
+    fetchJournal();
+    fetchChats();
+
+    const interval = setInterval(() => {
       fetchSignals();
       fetchJournal();
-      const interval = setInterval(() => {
-        fetchSignals();
-        fetchJournal();
-      }, 10000);
-      
-      return () => clearInterval(interval);
-    }
-
-    // Listen to signals from Firestore
-    const qSignals = query(collection(db, 'signals'), orderBy('timestamp', 'desc'), limit(50));
-    const unsubSignals = onSnapshot(qSignals, (snapshot) => {
-      const fetchedSignals = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      })) as Signal[];
-      setSignals(fetchedSignals);
-    }, (err) => {
-      try {
-        handleFirestoreError(err, OperationType.GET, 'signals');
-      } catch (e: any) {
-        if (e.message && e.message.includes('Quota limit exceeded')) {
-          console.warn("Firebase Quota Exceeded. Switching to offline mode.");
-          setIsOfflineMode(true);
-        } else {
-          setAppError(e);
-        }
-      }
-    });
-
-    // Listen to chat messages
-    const qChats = query(collection(db, 'chats'), orderBy('timestamp', 'asc'), limit(100));
-    const unsubChats = onSnapshot(qChats, (snapshot) => {
-      const fetchedChats = snapshot.docs.map(doc => ({
-        role: doc.data().role,
-        content: doc.data().content
-      }));
-      setChatMessages(fetchedChats as any);
-    }, (err) => {
-      try {
-        handleFirestoreError(err, OperationType.GET, 'chats');
-      } catch (e: any) {
-        if (e.message && e.message.includes('Quota limit exceeded')) {
-          console.warn("Firebase Quota Exceeded. Switching to offline mode.");
-          setIsOfflineMode(true);
-        } else {
-          setAppError(e);
-        }
-      }
-    });
-
-    // Listen to journal
-    const qJournal = query(collection(db, 'trading_journal'), orderBy('timestamp', 'desc'), limit(100));
-    const unsubJournal = onSnapshot(qJournal, (snapshot) => {
-      const fetchedJournal = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
-      setJournal(fetchedJournal);
-    }, (err) => {
-      try {
-        handleFirestoreError(err, OperationType.GET, 'trading_journal');
-      } catch (e: any) {
-        if (e.message && e.message.includes('Quota limit exceeded')) {
-          console.warn("Firebase Quota Exceeded. Switching to offline mode.");
-          setIsOfflineMode(true);
-        } else {
-          setAppError(e);
-        }
-      }
-    });
-
-    return () => {
-      unsubSignals();
-      unsubChats();
-      unsubJournal();
-    };
-  }, [user, isOfflineMode]);
+      fetchChats();
+    }, 10000); // Poll every 10 seconds
+    
+    return () => clearInterval(interval);
+  }, [user]);
 
   // Helper to format CCXT symbol to TradingView Futures symbol
   const getTVSymbol = (sym: string) => {
@@ -845,6 +794,11 @@ export default function App() {
                         <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
                         {isSyncing ? 'Syncing...' : 'Sync History'}
                       </button>
+                      {syncMessage && (
+                        <span className={`text-sm ${syncMessage.type === 'success' ? 'text-emerald-400' : 'text-red-400'}`}>
+                          {syncMessage.text}
+                        </span>
+                      )}
                     </div>
                   </div>
                   {journal.length > 0 && (

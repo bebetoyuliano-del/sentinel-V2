@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Play, Square, Wallet, TrendingUp, History, AlertCircle, Target } from 'lucide-react';
+import { Play, Square, Wallet, TrendingUp, History, AlertCircle, Target, Loader2, AlertTriangle } from 'lucide-react';
 
 export default function PaperTradingView() {
   const [isRunning, setIsRunning] = useState(false);
@@ -9,6 +9,8 @@ export default function PaperTradingView() {
   const [monitoring, setMonitoring] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [isResetting, setIsResetting] = useState(false);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
 
   const fetchData = async () => {
     try {
@@ -62,6 +64,27 @@ export default function PaperTradingView() {
     }
   };
 
+  const handleReset = async () => {
+    if (!showResetConfirm) {
+      setShowResetConfirm(true);
+      setTimeout(() => setShowResetConfirm(false), 3000); // Reset after 3 seconds if not confirmed
+      return;
+    }
+
+    setIsResetting(true);
+    try {
+      const res = await fetch('/api/paper/reset', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to reset account');
+      await fetchData();
+      setShowResetConfirm(false);
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setIsResetting(false);
+    }
+  };
+
   if (loading) {
     return <div className="flex items-center justify-center h-64 text-slate-400">Loading paper trading data...</div>;
   }
@@ -73,20 +96,39 @@ export default function PaperTradingView() {
           <h2 className="text-2xl font-bold text-white">Paper Trading</h2>
           <p className="text-slate-400 text-sm">Virtual trading environment using live market data</p>
         </div>
-        <button
-          onClick={toggleEngine}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${
-            isRunning 
-              ? 'bg-red-500/10 text-red-500 hover:bg-red-500/20' 
-              : 'bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20'
-          }`}
-        >
-          {isRunning ? (
-            <><Square className="w-4 h-4" /> Stop Engine</>
-          ) : (
-            <><Play className="w-4 h-4" /> Start Engine</>
-          )}
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={handleReset}
+            disabled={isResetting}
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${
+              showResetConfirm 
+                ? 'bg-red-500/20 text-red-500 hover:bg-red-500/30' 
+                : 'bg-slate-700/50 text-slate-300 hover:bg-slate-700'
+            } ${isResetting ? 'opacity-50 cursor-not-allowed' : ''}`}
+          >
+            {isResetting ? (
+              <><Loader2 className="w-4 h-4 animate-spin" /> Resetting...</>
+            ) : showResetConfirm ? (
+              <><AlertTriangle className="w-4 h-4" /> Confirm Reset</>
+            ) : (
+              <>Reset Account</>
+            )}
+          </button>
+          <button
+            onClick={toggleEngine}
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${
+              isRunning 
+                ? 'bg-red-500/10 text-red-500 hover:bg-red-500/20' 
+                : 'bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20'
+            }`}
+          >
+            {isRunning ? (
+              <><Square className="w-4 h-4" /> Stop Engine</>
+            ) : (
+              <><Play className="w-4 h-4" /> Start Engine</>
+            )}
+          </button>
+        </div>
       </div>
 
       {error && (
@@ -97,7 +139,7 @@ export default function PaperTradingView() {
       )}
 
       {/* Wallet Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
         <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-4">
           <div className="flex items-center gap-2 text-slate-400 mb-2">
             <Wallet className="w-4 h-4" />
@@ -125,6 +167,27 @@ export default function PaperTradingView() {
             ${wallet?.freeMargin?.toFixed(2) || '0.00'}
           </div>
         </div>
+        <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-4">
+          <div className="flex items-center gap-2 text-slate-400 mb-2">
+            <AlertCircle className="w-4 h-4" />
+            <span className="text-sm font-medium">Margin Ratio</span>
+          </div>
+          <div className={`text-2xl font-bold ${
+            (wallet?.marginRatio || 0) > 25 ? 'text-red-400' : 
+            (wallet?.marginRatio || 0) > 15 ? 'text-amber-400' : 'text-emerald-400'
+          }`}>
+            {wallet?.marginRatio?.toFixed(2) || '0.00'}%
+          </div>
+        </div>
+        <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-4">
+          <div className="flex items-center gap-2 text-slate-400 mb-2">
+            <Target className="w-4 h-4" />
+            <span className="text-sm font-medium">Leverage</span>
+          </div>
+          <div className="text-2xl font-bold text-emerald-400">
+            20x
+          </div>
+        </div>
       </div>
 
       {/* Strategy Monitoring & Plans */}
@@ -148,7 +211,7 @@ export default function PaperTradingView() {
               {monitoring.length === 0 ? (
                 <tr>
                   <td colSpan={5} className="px-4 py-8 text-center text-slate-500">
-                    No symbols being monitored. Ensure you have "Approved Settings".
+                    No symbols being monitored. Waiting for AI signals or open positions.
                   </td>
                 </tr>
               ) : (

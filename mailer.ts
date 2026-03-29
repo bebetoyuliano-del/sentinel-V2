@@ -19,10 +19,6 @@ interface MailOptions {
  * @param opts Optional metadata like runId or archiveKey
  */
 export async function sendDecisionCardsEmail(cardsArray: any[], excelRows?: any[], opts: MailOptions = {}): Promise<void> {
-  // PENDING: Sistem pengiriman email ke Outlook dengan attachment JSON sedang ditunda (pending)
-  console.log("⏳ [Mailer] PENDING: Sistem pengiriman email ke Outlook dengan attachment JSON sedang ditunda sementara.");
-  return;
-
   // 1. Validation
   if (!Array.isArray(cardsArray)) {
     console.error("❌ [Mailer] Validation Error: cardsArray must be an array.");

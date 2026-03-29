@@ -26,6 +26,7 @@ import { composeExcelRows } from './src/utils/ExcelBuilder';
 import { escapeHtml, renderDecisionCardsToTelegram } from './src/renderers/TelegramRenderer';
 import { sendTelegramMessage, sendInteractiveMenu, sendTradingMenu, sendHedgeMenu } from './src/services/TelegramService';
 import { uploadAnalysisToGCS } from './src/services/GCSService';
+import { sendDecisionCardsEmail } from './mailer';
 import { PolicyMapper } from './src/core/PolicyMapper';
 import { PolicyContextData } from './src/core/PolicyContext';
 
@@ -230,7 +231,6 @@ async function initFirebase() {
   }
 }
 
-import { sendDecisionCardsEmail } from './mailer';
 
 import { rangeFilterPineExact, RFParams } from './range_filter_pine';
 import { mapTfToMs, stripUnclosed, runTfAlignmentUnitTest } from './tf_alignment_guard';
@@ -2597,8 +2597,8 @@ async function runPaperTradingEngine() {
           
           if (signalData && signalData.targets) {
             // Use T2 as final Take Profit, T1 can be used for partials/locks
-            tpPrice = signalData.targets.t2 || signalData.targets.t1 || 0;
-            slPrice = signalData.stop_loss || 0;
+            tpPrice = parseFloat(String(signalData.targets.t2)) || parseFloat(String(signalData.targets.t1)) || 0;
+            slPrice = parseFloat(String(signalData.stop_loss)) || 0;
           }
           
           if (tpPrice === 0) {
@@ -2607,7 +2607,7 @@ async function runPaperTradingEngine() {
 
           const journalEntry = {
             id: journalId, timestamp: new Date().toISOString(), symbol, side, entryPrice: currentPrice,
-            stopLoss: slPrice, target1: signalData?.targets?.t1 || 0, target2: tpPrice, reason, sentiment: signalData?.sentiment || 'NEUTRAL', status: 'OPEN', source: 'PAPER_BOT', pnl: 0
+            stopLoss: slPrice, target1: signalData?.targets?.t1 ? (parseFloat(String(signalData.targets.t1)) || 0) : 0, target2: tpPrice, reason, sentiment: signalData?.sentiment || 'NEUTRAL', status: 'OPEN', source: 'PAPER_BOT', pnl: 0
           };
           await setDoc(doc(db, 'trading_journal', journalId), journalEntry);
 
@@ -2749,7 +2749,11 @@ async function runPaperTradingEngine() {
                   shortPos = undefined;
                   if (longPos) {
                     longPos.realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + realized;
-                    await setDoc(doc(db, 'paper_positions', longPos.id), { realizedHedgeProfit: longPos.realizedHedgeProfit }, { merge: true });
+                    longPos.lastSignalId = freshSignal.id;
+                    await setDoc(doc(db, 'paper_positions', longPos.id), { 
+                      realizedHedgeProfit: longPos.realizedHedgeProfit,
+                      lastSignalId: freshSignal.id
+                    }, { merge: true });
                   }
                 } else if (signalSide === 'SHORT' && longPos.currentPnl > 0) {
                   const realized = longPos.currentPnl;
@@ -2757,7 +2761,11 @@ async function runPaperTradingEngine() {
                   longPos = undefined;
                   if (shortPos) {
                     shortPos.realizedHedgeProfit = (shortPos.realizedHedgeProfit || 0) + realized;
-                    await setDoc(doc(db, 'paper_positions', shortPos.id), { realizedHedgeProfit: shortPos.realizedHedgeProfit }, { merge: true });
+                    shortPos.lastSignalId = freshSignal.id;
+                    await setDoc(doc(db, 'paper_positions', shortPos.id), { 
+                      realizedHedgeProfit: shortPos.realizedHedgeProfit,
+                      lastSignalId: freshSignal.id
+                    }, { merge: true });
                   }
                 }
                 
@@ -2780,7 +2788,11 @@ async function runPaperTradingEngine() {
                       if (excessPnl > 0) { // Pastikan bagian yang di-reduce profit
                         await partialClosePos(longPos, excessSize, 'Reduce Long (Trend Reversed DOWN)');
                         longPos.realizedHedgeProfit = (longPos.realizedHedgeProfit || 0) + excessPnl;
-                        await setDoc(doc(db, 'paper_positions', longPos.id), { realizedHedgeProfit: longPos.realizedHedgeProfit }, { merge: true });
+                        longPos.lastSignalId = freshSignal.id;
+                        await setDoc(doc(db, 'paper_positions', longPos.id), { 
+                          realizedHedgeProfit: longPos.realizedHedgeProfit,
+                          lastSignalId: freshSignal.id
+                        }, { merge: true });
                       }
                     } else if (isShortProfit && isLongLoss && setting.structure21Mode) {
                       // Trend DOWN, SHORT profit. ADD_SHORT untuk struktur 2:1 (LONG 1, SHORT 2).
@@ -2796,7 +2808,11 @@ async function runPaperTradingEngine() {
                       if (excessPnl > 0) { // Pastikan bagian yang di-reduce profit
                         await partialClosePos(shortPos, excessSize, 'Reduce Short (Trend Reversed UP)');
                         shortPos.realizedHedgeProfit = (shortPos.realizedHedgeProfit || 0) + excessPnl;
-                        await setDoc(doc(db, 'paper_positions', shortPos.id), { realizedHedgeProfit: shortPos.realizedHedgeProfit }, { merge: true });
+                        shortPos.lastSignalId = freshSignal.id;
+                        await setDoc(doc(db, 'paper_positions', shortPos.id), { 
+                          realizedHedgeProfit: shortPos.realizedHedgeProfit,
+                          lastSignalId: freshSignal.id
+                        }, { merge: true });
                       }
                     } else if (isLongProfit && isShortLoss && setting.structure21Mode) {
                       // Trend UP, LONG profit. ADD_LONG untuk struktur 2:1 (LONG 2, SHORT 1).
@@ -3405,6 +3421,79 @@ function addLog(msg: string) {
   console.log(msg);
 }
 
+
+async function archivePaperTradingData() {
+  if (!db) return { error: 'Firestore not initialized' };
+  
+  try {
+    addLog("📦 Starting Paper Trading Archiving...");
+    
+    // 1. Fetch data to archive
+    const historySnap = await getDocs(collection(db, 'paper_history'));
+    const journalSnap = await getDocs(collection(db, 'trading_journal'));
+    
+    const history = historySnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    const journal = journalSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    
+    if (history.length === 0 && journal.length === 0) {
+      addLog("ℹ️ No paper trading data found to archive.");
+      return { message: 'No data to archive' };
+    }
+    
+    const archiveData = {
+      timestamp: new Date().toISOString(),
+      paper_history: history,
+      trading_journal: journal
+    };
+    
+    // 2. Upload to GCS
+    const gcsResult = await uploadAnalysisToGCS(archiveData, { type: 'paper_trading_archive' }, { prefix: 'archives/paper-trading' });
+    
+    // 3. Send to Email (Outlook)
+    try {
+      await sendDecisionCardsEmail(history, journal, { archiveKey: gcsResult?.objectName });
+      addLog("📧 Archive sent to Email (Outlook).");
+    } catch (mailErr) {
+      console.error("Failed to send archive email:", mailErr);
+    }
+    
+    // 4. Send to Telegram
+    if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+      let msg = `📦 <b>Paper Trading Archive Completed</b>\n\n`;
+      msg += `• History Records: ${history.length}\n`;
+      msg += `• Journal Records: ${journal.length}\n`;
+      if (gcsResult?.url) {
+        msg += `\n🔗 <a href="${gcsResult.url}">Download Archive (JSON)</a>`;
+      }
+      await sendTelegramMessage(msg);
+      addLog("📱 Archive notification sent to Telegram.");
+    }
+    
+    // 5. Clear Firestore collections to save reads/space
+    if (gcsResult) {
+      const batch = writeBatch(db);
+      historySnap.docs.forEach(doc => batch.delete(doc.ref));
+      journalSnap.docs.forEach(doc => batch.delete(doc.ref));
+      await batch.commit();
+      addLog(`✅ Archived and cleared ${history.length + journal.length} records from Firestore.`);
+    }
+    
+    return { 
+      success: true, 
+      archivedCount: history.length + journal.length,
+      gcs: gcsResult?.objectName 
+    };
+  } catch (error: any) {
+    console.error('Archive failed:', error);
+    return { error: error.message };
+  }
+}
+
+app.post('/api/archive/paper-trading', async (req, res) => {
+  const result = await archivePaperTradingData();
+  if (result.error) return res.status(500).json(result);
+  res.json(result);
+});
 
 app.get('/api/debug-logs', (req, res) => {
   res.json({ logs: logBuffer });
@@ -5497,6 +5586,12 @@ async function checkRiskAndNotify() {
 
 // Schedule Risk Manager every 10 minutes
 // Moved to scheduleCronJobs()
+
+// Cron job to archive paper trading data daily at 00:00
+cron.schedule('0 0 * * *', async () => {
+  addLog("⏰ Running scheduled daily paper trading archive...");
+  await archivePaperTradingData();
+});
 
 app.listen(PORT, '0.0.0.0', async () => {
     console.log(`Server running on http://localhost:${PORT}`);

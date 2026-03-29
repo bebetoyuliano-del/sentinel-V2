@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Activity, Play, Square, TrendingUp, AlertCircle, RefreshCw, MessageSquare, Target, BarChart2, X, Bot, User, Send, LogOut, CheckCircle2, BookOpen, FlaskConical } from 'lucide-react';
+import { Activity, Play, Square, TrendingUp, AlertCircle, RefreshCw, MessageSquare, Target, BarChart2, X, Bot, User, Send, LogOut, CheckCircle2, BookOpen, FlaskConical, Archive } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { AdvancedRealTimeChart } from 'react-ts-tradingview-widgets';
 import { auth, db, loginWithGoogle, logout } from './firebase';
@@ -114,6 +114,8 @@ export default function App() {
   const [appError, setAppError] = useState<Error | null>(null);
   const [isOfflineMode, setIsOfflineMode] = useState(false);
   const [syncMessage, setSyncMessage] = useState<{text: string, type: 'success' | 'error'} | null>(null);
+  const [isArchiving, setIsArchiving] = useState(false);
+  const [archiveMessage, setArchiveMessage] = useState<{ text: string, type: 'success' | 'error' } | null>(null);
 
   if (appError) {
     throw appError;
@@ -135,6 +137,26 @@ export default function App() {
     } finally {
       setIsSyncing(false);
       setTimeout(() => setSyncMessage(null), 5000);
+    }
+  };
+
+  const handleArchive = async () => {
+    if (isArchiving) return;
+    if (!window.confirm("Are you sure you want to archive and clear paper trading history? This will move data to GCS/Email and clear Firestore.")) return;
+    
+    setIsArchiving(true);
+    setArchiveMessage(null);
+    try {
+      const res = await fetch('/api/archive/paper-trading', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to archive');
+      setArchiveMessage({ text: `Archived ${data.archivedCount} records!`, type: 'success' });
+      setTimeout(() => setArchiveMessage(null), 5000);
+    } catch (err: any) {
+      console.error('Archive error:', err);
+      setArchiveMessage({ text: err.message, type: 'error' });
+    } finally {
+      setIsArchiving(false);
     }
   };
 
@@ -794,9 +816,23 @@ export default function App() {
                         <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
                         {isSyncing ? 'Syncing...' : 'Sync History'}
                       </button>
+                      <button
+                        onClick={handleArchive}
+                        disabled={isArchiving}
+                        className="px-3 py-1.5 bg-emerald-900/30 hover:bg-emerald-900/50 text-emerald-400 text-sm rounded-lg flex items-center gap-2 transition-colors disabled:opacity-50 border border-emerald-800/50"
+                        title="Archive and clear paper trading history to GCS/Email"
+                      >
+                        <Archive className={`w-4 h-4 ${isArchiving ? 'animate-pulse' : ''}`} />
+                        {isArchiving ? 'Archiving...' : 'Archive Data'}
+                      </button>
                       {syncMessage && (
                         <span className={`text-sm ${syncMessage.type === 'success' ? 'text-emerald-400' : 'text-red-400'}`}>
                           {syncMessage.text}
+                        </span>
+                      )}
+                      {archiveMessage && (
+                        <span className={`text-sm ${archiveMessage.type === 'success' ? 'text-emerald-400' : 'text-red-400'}`}>
+                          {archiveMessage.text}
                         </span>
                       )}
                     </div>

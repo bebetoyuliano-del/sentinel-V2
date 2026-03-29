@@ -138,15 +138,15 @@ service cloud.firestore {
       return hasOnlyAllowedFields(['id', 'symbol', 'side', 'entryPrice', 'exitPrice', 'pnl', 'reason', 'timestamp', 'stopLoss', 'target1', 'target2', 'sentiment', 'status', 'source', 'closedAt', 'closeReason']) &&
              data.symbol is string && data.symbol.size() > 0 && data.symbol.size() < 50 &&
              data.side is string && data.side.size() > 0 && data.side.size() < 50 &&
-             data.pnl is number &&
+             (data.pnl is number || data.pnl is string) &&
              data.timestamp is string && data.timestamp.size() < 50 &&
              (!('id' in data) || data.id is string) &&
-             (!('entryPrice' in data) || data.entryPrice == null || data.entryPrice is number) &&
-             (!('exitPrice' in data) || data.exitPrice == null || data.exitPrice is number) &&
-             (!('stopLoss' in data) || data.stopLoss == null || data.stopLoss is number) &&
-             (!('target1' in data) || data.target1 == null || data.target1 is number) &&
-             (!('target2' in data) || data.target2 == null || data.target2 is number) &&
-             (!('sentiment' in data) || data.sentiment == null || data.sentiment is string) &&
+             (!('entryPrice' in data) || data.entryPrice == null || data.entryPrice is number || data.entryPrice is string) &&
+             (!('exitPrice' in data) || data.exitPrice == null || data.exitPrice is number || data.exitPrice is string) &&
+             (!('stopLoss' in data) || data.stopLoss == null || data.stopLoss is number || data.stopLoss is string) &&
+             (!('target1' in data) || data.target1 == null || data.target1 is number || data.target1 is string) &&
+             (!('target2' in data) || data.target2 == null || data.target2 is number || data.target2 is string) &&
+             (!('sentiment' in data) || data.sentiment == null || data.sentiment is string || data.sentiment is map) &&
              (!('status' in data) || data.status == null || data.status is string) &&
              (!('source' in data) || data.source == null || data.source is string) &&
              (!('reason' in data) || data.reason == null || (data.reason is string && data.reason.size() < 10000)) &&

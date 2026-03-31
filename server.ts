@@ -1179,6 +1179,9 @@ async function monitorMarkets(force = false) {
          - Batas toleransi pergerakan harga asli (spot price) yang melawan posisi kita.
          - Dihitung dari persentase pergerakan harga spot, BUKAN dari Margin Ratio (MR).
          - Jika harga spot bergerak melawan > 4% → struktur dianggap berat, fokus utama: de-risk.
+      8. MarginBleedRisk (MBR) adalah klasifikasi risiko kenaikan Margin Ratio yang muncul ketika Structure = LOCK_1TO1, akibat notional value kedua sisi posisi bertambah seiring pergerakan harga,
+         sementara equity akun stagnan karena PnL net terkunci.
+         Tujuan MBR digunakan untuk mengidentifikasi kondisi di mana LOCK 1:1 tidak boleh dipertahankan secara pasif dan memerlukan exit urgency
 
       ============================================================
       SECTION 2A – HIERARKI BACA TREND & KONFIRMASI PERUBAHAN TREND
@@ -1497,6 +1500,7 @@ Untuk setiap pair dengan posisi terbuka, AI WAJIB secara internal memahami minim
 - BEPType = GROSS / NET / UNKNOWN
 - WhyAllowed = alasan aksi valid
 - WhyBlocked = alasan aksi diblok
+- MRNow = Margin Ratio akun saat ini (snapshot evaluasi)
 
 tidak wajib menampilkan semua field di output akhir JSON,
 tetapi WAJIB menggunakannya dalam reasoning internal agar semua modul Sentinel tetap konsisten.
@@ -1563,6 +1567,18 @@ Contoh:
            • LOCK_NEUTRAL
            • REDUCE pada leg hijau
            • TAKE_PROFIT defensif
+       3B. LOCK_EXIT_URGENCY (MARGIN-AWARE OVERRIDE) (WAJIB)
+           Dalam Cross Margin Hedge Mode, LOCK 1:1 membekukan PnL net namun tidak membekukan Margin Ratio.
+           Jika Structure = LOCK_1TO1 dan MarginBleedRisk = HIGH serta
+           (MRNow >= 23% atau MRProjected_Up2 >= 25%),
+           dan PrimaryTrend4H = UP dengan TrendStatus = CONTINUATION_CONFIRMED,
+           serta leg LONG dalam kondisi profit (hijau),
+           maka Sentinel BOLEH melakukan ADD_LONG_0.5 secara konservatif
+           pada zona Smart Money Concept (Bullish FVG, Bullish Order Block, atau Demand tervalidasi)
+           untuk mengubah struktur menjadi LONG_2_SHORT_1.
+           Aksi ini HANYA boleh dilakukan jika MRProjected_after_add tetap < 25%
+           dan tidak melanggar guardrail ambigu, CHOP, atau RECOVERY_SUSPENDED.
+          REDUCE atau CUT pada leg merah tetap DILARANG sesuai Golden Rule.
       4.	RECOVERY_SUSPENDED / DEAD MARKET OVERRIDE
          •	Jika pair masuk kondisi CHOP berat atau DEAD MARKET, maka RECOVERY_SUSPENDED bertindak sebagai execution override yang memblok ekspansi recovery baru.
          •	Dalam kondisi ini, meskipun ada sinyal teknikal yang tampak menarik, AI tetap harus defensif.
@@ -1625,7 +1641,26 @@ Contoh:
           • DILARANG ekspansi,
           • hanya boleh: reduce, lock, take profit,
           • tujuan utama: turunkan MR secepat mungkin.
+          
+      ============================================================
+      SECTION 3B – LOCK_EXIT_URGENCY (MARGIN-AWARE OVERRIDE) (WAJIB)
+      ============================================================
+      Dalam Cross Margin Hedge Mode, LOCK 1:1 membekukan PnL net namun tidak membekukan Margin Ratio.
+      Jika Structure = LOCK_1TO1 dan MarginBleedRisk = HIGH serta
+      (MRNow >= 23% atau MRProjected_Up2 >= 25%),
+      dan PrimaryTrend4H = UP dengan TrendStatus = CONTINUATION_CONFIRMED,
+      serta leg LONG dalam kondisi profit (hijau),
+      maka Sentinel BOLEH melakukan ADD_LONG_0.5 secara konservatif
+      pada zona Smart Money Concept (Bullish FVG, Bullish Order Block, atau Demand tervalidasi)
+      untuk mengubah struktur menjadi LONG_2_SHORT_1.
+      Aksi ini HANYA boleh dilakukan jika MRProjected_after_add tetap < 25%
+      dan tidak melanggar guardrail ambigu, CHOP, atau RECOVERY_SUSPENDED.
+      REDUCE atau CUT pada leg merah tetap DILARANG sesuai Golden Rule.
 
+     MRNow adalah Margin Ratio akun saat ini (real-time snapshot),
+     yang digunakan sebagai dasar utama penilaian risiko sebelum setiap aksi.
+     MRNow merepresentasikan beban margin berjalan terhadap equity akun,
+     dan WAJIB diperiksa sebelum mempertimbangkan ADD, ekspansi recovery, atau perubahan struktur
       Setiap kali menggambar skenario:
       - Jika MRProjected dari suatu aksi > 25% → JANGAN sarankan aksi ekspansi.
       - Utamakan aksi yang:
@@ -2423,10 +2458,127 @@ function backgroundSyncFirestore(promise: Promise<any>) {
   });
 }
 
+// Helper to calculate margin used based on current notional value (Binance Hedge Mode logic)
+function calculateMarginUsed(pos: any, leverage: number): number {
+  const entryNotional = pos.size * pos.entryPrice;
+  const pnl = pos.currentPnl !== undefined ? pos.currentPnl : (pos.unrealizedPnl || 0);
+  const currentNotional = pos.side === 'LONG' ? entryNotional + pnl : entryNotional - pnl;
+  return Math.max(0, currentNotional) / leverage;
+}
+
+// SOP Helper: Classify Structure with tolerance (SOP 2AB)
+function classifyStructure(longSize: number, shortSize: number): string {
+  if (longSize === 0 && shortSize === 0) return 'NONE';
+  if (longSize === 0) return 'SHORT_ONLY';
+  if (shortSize === 0) return 'LONG_ONLY';
+  
+  const ratioLS = longSize / shortSize;
+  const ratioSL = shortSize / longSize;
+
+  if (ratioLS >= 0.95 && ratioLS <= 1.05) return 'LOCK_1TO1';
+  
+  if (ratioLS >= 1.90 && ratioLS <= 2.10) return 'LONG_2_SHORT_1';
+  if (ratioSL >= 1.90 && ratioSL <= 2.10) return 'SHORT_2_LONG_1';
+  
+  if (ratioLS >= 1.40 && ratioLS <= 1.60) return 'LONG_1P5_SHORT_1';
+  if (ratioSL >= 1.40 && ratioSL <= 1.60) return 'SHORT_1P5_LONG_1';
+  
+  return 'OTHER';
+}
+
+// SOP Helper: Compute Projected MR after adding size (Consistent with Proxy MR)
+function computeMRProjectedAfterAdd(wallet: any, openPositions: any[], posToModifyId: string, additionalSize: number, currentPrice: number, leverage: number): number {
+  let totalProjectedMargin = 0;
+  let targetFound = false;
+  
+  for (const p of openPositions) {
+    if (p.status === 'OPEN') {
+      if (p.id === posToModifyId) {
+        // Posisi TARGET: Gunakan projected margin (size + additional) * currentPrice / leverage
+        totalProjectedMargin += ((p.size + additionalSize) * currentPrice) / leverage;
+        targetFound = true;
+      } else {
+        // Posisi NON-target: Gunakan currentPrice jika ada (Iterasi 5), fallback ke calculateMarginUsed
+        if (p.currentPrice !== undefined && p.currentPrice !== null) {
+          totalProjectedMargin += (p.size * p.currentPrice) / leverage;
+        } else {
+          totalProjectedMargin += calculateMarginUsed(p, leverage);
+        }
+      }
+    }
+  }
+  
+  // Jika posToModifyId tidak ditemukan (misal: entry baru), tambahkan projected margin
+  if (!targetFound) {
+    totalProjectedMargin += (additionalSize * currentPrice) / leverage;
+  }
+  
+  const equity = (wallet.equity && wallet.equity > 0) ? wallet.equity : wallet.balance;
+  return equity > 0 ? (totalProjectedMargin / equity) * 100 : 0;
+}
+
+// SOP Helper: Check Spot Adverse Move > 4% (Legacy Only - SOP 4.2)
+function checkSpotAdverseMove(pos: any, currentPrice: number, resetTime: number): boolean {
+  if (!pos || !pos.openedAt) return false;
+  const openedAtMs = new Date(pos.openedAt).getTime();
+  // Jika trade baru (>= resetTime) dan bukan flag legacy, maka abaikan (return false)
+  if (openedAtMs >= resetTime && !pos.isLegacy) return false;
+  
+  const entryPrice = pos.entryPrice ?? 0;
+  if (entryPrice === 0) return false;
+
+  if (pos.side === 'LONG') {
+    return ((entryPrice - currentPrice) / entryPrice) > 0.04;
+  } else {
+    return ((currentPrice - entryPrice) / entryPrice) > 0.04;
+  }
+}
+
+// SOP Helper: Post-Action Reclassification (SOP 6.6)
+function reclassifyState(longPos: any, shortPos: any, currentPrice: number) {
+  const lSize = longPos?.size ?? 0;
+  const sSize = shortPos?.size ?? 0;
+  const structure = classifyStructure(lSize, sSize);
+  
+  let greenLeg = 'NONE';
+  let redLeg = 'NONE';
+  
+  const lPnl = longPos?.currentPnl ?? 0;
+  const sPnl = shortPos?.currentPnl ?? 0;
+
+  if (lPnl > 0) greenLeg = 'LONG';
+  if (sPnl > 0) greenLeg = greenLeg === 'NONE' ? 'SHORT' : 'BOTH';
+  
+  if (lPnl < 0) redLeg = 'LONG';
+  if (sPnl < 0) redLeg = redLeg === 'NONE' ? 'SHORT' : 'BOTH';
+  
+  let hedgeLegStatus = 'NONE';
+  if (structure === 'LOCK_1TO1') {
+    hedgeLegStatus = 'HEDGE_FULL';
+  } else if (lSize > 0 && sSize > 0) {
+    hedgeLegStatus = 'RESIDUAL_OPPOSING_LEG';
+  }
+  
+  const contextMode = structure === 'LOCK_1TO1' ? 'LOCK_WAIT_SEE' : 'UNKNOWN';
+  
+  return { structure, greenLeg, redLeg, hedgeLegStatus, contextMode };
+}
+
 // Paper Trading Engine Logic
+let isPaperEngineRunning = false;
+
 async function runPaperTradingEngine() {
+  if (isPaperEngineRunning) {
+    console.log(`[PAPER] Engine is already running. Skipping this cycle.`);
+    return;
+  }
+  isPaperEngineRunning = true;
+
   await ensureAuth();
-  if (!db) return;
+  if (!db) {
+    isPaperEngineRunning = false;
+    return;
+  }
 
   console.log(`[PAPER] Running Paper Trading Engine at ${new Date().toISOString()}`);
 
@@ -2436,7 +2588,58 @@ async function runPaperTradingEngine() {
     let wallet = cachedPaperWallet;
 
     // 2. Fetch Open Positions
-    const openPositions = cachedPaperPositions;
+    let openPositions = cachedPaperPositions;
+
+    // Consolidate duplicate positions (same symbol, same side)
+    const grouped = openPositions.reduce((acc, pos) => {
+      if (pos.status === 'OPEN') {
+        const key = `${pos.symbol}_${pos.side}`;
+        if (!acc[key]) acc[key] = [];
+        acc[key].push(pos);
+      }
+      return acc;
+    }, {} as Record<string, any[]>);
+
+    for (const key in grouped) {
+      const group = grouped[key];
+      if (group.length > 1) {
+        console.log(`[PAPER] Consolidating ${group.length} duplicate positions for ${key}`);
+        let totalSize = 0;
+        let totalValue = 0;
+        let mainId = group[0].id;
+        let earliestTime = group[0].openedAt;
+
+        for (const p of group) {
+          totalSize += p.size;
+          totalValue += p.size * p.entryPrice;
+          if (new Date(p.openedAt) < new Date(earliestTime)) {
+            earliestTime = p.openedAt;
+            mainId = p.id;
+          }
+        }
+
+        const avgEntryPrice = totalValue / totalSize;
+        const mainPosIndex = openPositions.findIndex(p => p.id === mainId);
+        
+        if (mainPosIndex > -1) {
+          openPositions[mainPosIndex].size = totalSize;
+          openPositions[mainPosIndex].entryPrice = avgEntryPrice;
+          
+          backgroundSyncFirestore(setDoc(doc(db, 'paper_positions', mainId), {
+            size: totalSize,
+            entryPrice: avgEntryPrice
+          }, { merge: true }));
+        }
+
+        for (const p of group) {
+          if (p.id !== mainId) {
+            const idx = openPositions.findIndex(op => op.id === p.id);
+            if (idx > -1) openPositions.splice(idx, 1);
+            backgroundSyncFirestore(deleteDoc(doc(db, 'paper_positions', p.id)));
+          }
+        }
+      }
+    }
 
     // 3. Determine symbols to process
     const freshSignals = signals.filter(s => 
@@ -2459,20 +2662,12 @@ async function runPaperTradingEngine() {
     let totalUnrealized = 0;
     let totalMarginUsed = 0;
     const LEVERAGE = 20; // Default leverage for paper trading
-    const symbolMargins: Record<string, { long: number, short: number }> = {};
     
     for (const pos of openPositions) {
       if (pos.status === 'OPEN') {
         totalUnrealized += pos.unrealizedPnl || 0;
-        if (!symbolMargins[pos.symbol]) symbolMargins[pos.symbol] = { long: 0, short: 0 };
-        const margin = (pos.size * pos.entryPrice) / LEVERAGE;
-        if (pos.side === 'LONG') symbolMargins[pos.symbol].long += margin;
-        else symbolMargins[pos.symbol].short += margin;
+        totalMarginUsed += calculateMarginUsed(pos, LEVERAGE);
       }
-    }
-    
-    for (const sym in symbolMargins) {
-      totalMarginUsed += Math.max(symbolMargins[sym].long, symbolMargins[sym].short);
     }
     
     wallet.equity = wallet.balance + totalUnrealized;
@@ -2567,11 +2762,13 @@ async function runPaperTradingEngine() {
         // Calculate PnL
         let totalUnrealizedPnl = 0;
         if (longPos) {
+          longPos.currentPrice = currentPrice;
           longPos.currentPnl = (currentPrice - longPos.entryPrice) * longPos.size;
           longPos.pnlPct = (longPos.currentPnl / (longPos.entryPrice * longPos.size)) * 100;
           totalUnrealizedPnl += longPos.currentPnl;
         }
         if (shortPos) {
+          shortPos.currentPrice = currentPrice;
           shortPos.currentPnl = (shortPos.entryPrice - currentPrice) * shortPos.size;
           shortPos.pnlPct = (shortPos.currentPnl / (shortPos.entryPrice * shortPos.size)) * 100;
           totalUnrealizedPnl += shortPos.currentPnl;
@@ -2581,21 +2778,12 @@ async function runPaperTradingEngine() {
         const updateWalletState = () => {
           let totalUnrealized = 0;
           let totalMarginUsed = 0;
-          const symbolMargins: Record<string, { long: number, short: number }> = {};
           
           for (const p of openPositions) {
             if (p.status === 'OPEN') {
               totalUnrealized += p.currentPnl !== undefined ? p.currentPnl : (p.unrealizedPnl || 0);
-              
-              if (!symbolMargins[p.symbol]) symbolMargins[p.symbol] = { long: 0, short: 0 };
-              const margin = (p.size * p.entryPrice) / LEVERAGE;
-              if (p.side === 'LONG') symbolMargins[p.symbol].long += margin;
-              else symbolMargins[p.symbol].short += margin;
+              totalMarginUsed += calculateMarginUsed(p, LEVERAGE);
             }
-          }
-          
-          for (const sym in symbolMargins) {
-            totalMarginUsed += Math.max(symbolMargins[sym].long, symbolMargins[sym].short);
           }
           
           wallet.equity = wallet.balance + totalUnrealized;
@@ -2790,6 +2978,8 @@ async function runPaperTradingEngine() {
             await closePos(longPos, 'Net Take Profit (Hedge Resolved)');
             await closePos(shortPos, 'Net Take Profit (Hedge Resolved)');
             longPos = undefined; shortPos = undefined;
+            const reclass = reclassifyState(longPos, shortPos, currentPrice);
+            console.log(`[PAPER] Post-Action Reclass (Hedge Resolved) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
           }
         } else {
           if (longPos) {
@@ -2800,9 +2990,13 @@ async function runPaperTradingEngine() {
             if (isAtTP) {
               await closePos(longPos, 'Take Profit (Sentinel Target)');
               longPos = undefined;
+              const reclass = reclassifyState(longPos, shortPos, currentPrice);
+              console.log(`[PAPER] Post-Action Reclass (TP) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
             } else if (isAtSL) {
               await closePos(longPos, 'Stop Loss (Sentinel Target)');
               longPos = undefined;
+              const reclass = reclassifyState(longPos, shortPos, currentPrice);
+              console.log(`[PAPER] Post-Action Reclass (SL) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
             }
           }
           if (shortPos) {
@@ -2813,9 +3007,13 @@ async function runPaperTradingEngine() {
             if (isAtTP) {
               await closePos(shortPos, 'Take Profit (Sentinel Target)');
               shortPos = undefined;
+              const reclass = reclassifyState(longPos, shortPos, currentPrice);
+              console.log(`[PAPER] Post-Action Reclass (TP) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
             } else if (isAtSL) {
               await closePos(shortPos, 'Stop Loss (Sentinel Target)');
               shortPos = undefined;
+              const reclass = reclassifyState(longPos, shortPos, currentPrice);
+              console.log(`[PAPER] Post-Action Reclass (SL) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
             }
           }
         }
@@ -2827,11 +3025,15 @@ async function runPaperTradingEngine() {
             const triggerHedge = longPos.stopLoss > 0 ? (currentPrice <= longPos.stopLoss) : (longPos.pnlPct <= -2.0);
             if (triggerHedge) {
               shortPos = await openPos('SHORT', longPos.size, 'Lock 1:1 (Sentinel SL Trigger)', 'HEDGE_TRIGGER');
+              const reclass = reclassifyState(longPos, shortPos, currentPrice);
+              console.log(`[PAPER] Post-Action Reclass (Hedge Trigger) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
             }
           } else if (shortPos && !longPos) {
             const triggerHedge = shortPos.stopLoss > 0 ? (currentPrice >= shortPos.stopLoss) : (shortPos.pnlPct <= -2.0);
             if (triggerHedge) {
               longPos = await openPos('LONG', shortPos.size, 'Lock 1:1 (Sentinel SL Trigger)', 'HEDGE_TRIGGER');
+              const reclass = reclassifyState(longPos, shortPos, currentPrice);
+              console.log(`[PAPER] Post-Action Reclass (Hedge Trigger) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
             }
           }
         }
@@ -2861,6 +3063,9 @@ async function runPaperTradingEngine() {
                   if (size * currentPrice > 10) { // Minimum trade size check
                     if (signalSide === 'LONG') longPos = await openPos('LONG', size, 'AI Signal Entry', freshSignal.id, freshSignal);
                     else shortPos = await openPos('SHORT', size, 'AI Signal Entry', freshSignal.id, freshSignal);
+                    const reclass = reclassifyState(longPos, shortPos, currentPrice);
+                    console.log(`[PAPER] Post-Action Reclass (New Entry) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+                    (freshSignal as any).reclass = reclass;
                   }
                 }
               } else if (longPos && shortPos) {
@@ -2880,6 +3085,9 @@ async function runPaperTradingEngine() {
                       lastSignalId: freshSignal.id
                     }, { merge: true }));
                   }
+                  const reclass = reclassifyState(longPos, shortPos, currentPrice);
+                  console.log(`[PAPER] Post-Action Reclass (Unlock Short) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+                  (freshSignal as any).reclass = reclass;
                 } else if (signalSide === 'SHORT' && longPos.currentPnl > 0) {
                   const realized = longPos.currentPnl;
                   await closePos(longPos, 'Unlock (Hedge in Profit)');
@@ -2892,6 +3100,9 @@ async function runPaperTradingEngine() {
                       lastSignalId: freshSignal.id
                     }, { merge: true }));
                   }
+                  const reclass = reclassifyState(longPos, shortPos, currentPrice);
+                  console.log(`[PAPER] Post-Action Reclass (Unlock Long) for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}`);
+                  (freshSignal as any).reclass = reclass;
                 }
                 
                 if (longPos && shortPos) {
@@ -2902,6 +3113,24 @@ async function runPaperTradingEngine() {
                   
                   const baseSize = Math.min(longPos.size, shortPos.size);
                   const additionalSize = baseSize * 0.5;
+
+                  // SOP Reclassification & Guards
+                  let currentStructure = classifyStructure(longPos.size, shortPos.size);
+                  const mrNow = wallet.marginRatio;
+                  const mrProjectedUp2 = mrNow * 1.02;
+                  const mrProjectedUp5 = mrNow * 1.05;
+                  const mbrHigh = currentStructure === 'LOCK_1TO1' && mrProjectedUp5 >= 25;
+                  
+                  const adverseLong = checkSpotAdverseMove(longPos, currentPrice, paperTradingResetTime);
+                  const adverseShort = checkSpotAdverseMove(shortPos, currentPrice, paperTradingResetTime);
+                  const isAdverseMoveBlocked = adverseLong || adverseShort;
+                  
+                  const hasTrendData = freshSignal.trend && freshSignal.trend.primary4H && freshSignal.trend.status;
+                  const hasSmcData = freshSignal.smc && freshSignal.smc.validated;
+                  const isAmbiguous = !hasTrendData || !hasSmcData;
+
+                  let actionTaken = false;
+                  let riskOverride = 'NONE';
 
                   // B. Trend Reversal & Profit Taking (Salah Satu Leg Profit)
                   // ATURAN MUTLAK: JANGAN PERNAH REDUCE/CUT LOSS PADA LEG MERAH. REDUCE HANYA PADA LEG HIJAU.
@@ -2918,11 +3147,38 @@ async function runPaperTradingEngine() {
                           realizedHedgeProfit: longPos.realizedHedgeProfit,
                           lastSignalId: freshSignal.id
                         }, { merge: true }));
+                        longPos.size -= excessSize; // Post-action reclass
+                        actionTaken = true;
                       }
-                    } else if (isShortProfit && isLongLoss && setting.structure21Mode) {
-                      // Trend DOWN, SHORT profit. ADD_SHORT untuk struktur 2:1 (LONG 1, SHORT 2).
-                      if (shortPos.size < baseSize * 2 && wallet.freeMargin > 0) {
-                        await addSize(shortPos, additionalSize, `Add 0.5x to Short (Trend Continuation DOWN)`, freshSignal.id);
+                    } else if (isShortProfit && isLongLoss) {
+                      // Check for LOCK_EXIT_URGENCY (Margin-Aware Override) or structure21Mode
+                      const isTrendDown = hasTrendData && freshSignal.trend.primary4H === 'DOWN' && freshSignal.trend.status === 'CONTINUATION_CONFIRMED';
+                      const isSmcValidShort = hasSmcData && freshSignal.smc.bias === 'BEARISH' && currentPrice >= freshSignal.smc.low && currentPrice <= freshSignal.smc.high;
+                      
+                      const isLockExitUrgencyShort = currentStructure === 'LOCK_1TO1' && 
+                                                mbrHigh && 
+                                                (mrNow >= 23 || mrProjectedUp2 >= 25) &&
+                                                isTrendDown && 
+                                                isSmcValidShort &&
+                                                !isAmbiguous;
+                      
+                      if (isAmbiguous && !isLockExitUrgencyShort) {
+                        riskOverride = 'AMBIGUITY_BLOCK';
+                        console.log(`[PAPER] Expansion blocked due to AMBIGUOUS signal metadata for ${symbol}`);
+                      } else if (isAdverseMoveBlocked) {
+                        riskOverride = 'ADVERSE_MOVE_BLOCK';
+                        console.log(`[PAPER] Expansion blocked due to adverse spot move > 4% for ${symbol}`);
+                      } else if (setting.structure21Mode || isLockExitUrgencyShort) {
+                        const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, shortPos.id, additionalSize, currentPrice, LEVERAGE);
+                        if (projectedMr < 25 && shortPos.size < baseSize * 2 && wallet.freeMargin > 0) {
+                          const reason = isLockExitUrgencyShort ? 'LOCK_EXIT_URGENCY (Margin-Aware Override)' : 'Add 0.5x to Short (Trend Continuation DOWN)';
+                          await addSize(shortPos, additionalSize, reason, freshSignal.id);
+                          shortPos.size += additionalSize; // Post-action reclass
+                          actionTaken = true;
+                        } else if (projectedMr >= 25) {
+                          riskOverride = 'MR_BLOCK';
+                          console.log(`[PAPER] Expansion blocked. Projected MR: ${projectedMr.toFixed(2)}% >= 25%`);
+                        }
                       }
                     }
                   } else if (signalSide === 'LONG') { // Trend baru UP
@@ -2938,22 +3194,80 @@ async function runPaperTradingEngine() {
                           realizedHedgeProfit: shortPos.realizedHedgeProfit,
                           lastSignalId: freshSignal.id
                         }, { merge: true }));
+                        shortPos.size -= excessSize; // Post-action reclass
+                        actionTaken = true;
                       }
-                    } else if (isLongProfit && isShortLoss && setting.structure21Mode) {
-                      // Trend UP, LONG profit. ADD_LONG untuk struktur 2:1 (LONG 2, SHORT 1).
-                      if (longPos.size < baseSize * 2 && wallet.freeMargin > 0) {
-                        await addSize(longPos, additionalSize, `Add 0.5x to Long (Trend Continuation UP)`, freshSignal.id);
+                    } else if (isLongProfit && isShortLoss) {
+                      // Check for LOCK_EXIT_URGENCY (Margin-Aware Override) or structure21Mode
+                      const isTrendUp = hasTrendData && freshSignal.trend.primary4H === 'UP' && freshSignal.trend.status === 'CONTINUATION_CONFIRMED';
+                      const isSmcValidLong = hasSmcData && freshSignal.smc.bias === 'BULLISH' && currentPrice >= freshSignal.smc.low && currentPrice <= freshSignal.smc.high;
+                      
+                      const isLockExitUrgencyLong = currentStructure === 'LOCK_1TO1' && 
+                                                mbrHigh && 
+                                                (mrNow >= 23 || mrProjectedUp2 >= 25) &&
+                                                isTrendUp && 
+                                                isSmcValidLong &&
+                                                !isAmbiguous;
+                      
+                      if (isAmbiguous && !isLockExitUrgencyLong) {
+                        riskOverride = 'AMBIGUITY_BLOCK';
+                        console.log(`[PAPER] Expansion blocked due to AMBIGUOUS signal metadata for ${symbol}`);
+                      } else if (isAdverseMoveBlocked) {
+                        riskOverride = 'ADVERSE_MOVE_BLOCK';
+                        console.log(`[PAPER] Expansion blocked due to adverse spot move > 4% for ${symbol}`);
+                      } else if (setting.structure21Mode || isLockExitUrgencyLong) {
+                        // Trend UP, LONG profit. ADD_LONG untuk struktur 2:1 (LONG 2, SHORT 1).
+                        const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, longPos.id, additionalSize, currentPrice, LEVERAGE);
+                        if (projectedMr < 25 && longPos.size < baseSize * 2 && wallet.freeMargin > 0) {
+                          const reason = isLockExitUrgencyLong ? 'LOCK_EXIT_URGENCY (Margin-Aware Override)' : 'Add 0.5x to Long (Trend Continuation UP)';
+                          await addSize(longPos, additionalSize, reason, freshSignal.id);
+                          longPos.size += additionalSize; // Post-action reclass
+                          actionTaken = true;
+                        } else if (projectedMr >= 25) {
+                          riskOverride = 'MR_BLOCK';
+                          console.log(`[PAPER] Expansion blocked. Projected MR: ${projectedMr.toFixed(2)}% >= 25%`);
+                        }
                       }
                     }
                   }
 
                   // C. Add 0.5 Mode (Jika kedua leg merah)
-                  if (isLongLoss && isShortLoss && setting.add05Mode && wallet.freeMargin > 0) {
-                    if (signalSide === 'LONG' && longPos.size < baseSize * 2) {
-                      await addSize(longPos, additionalSize, `Add 0.5x to Long (Recovery Mode)`, freshSignal.id);
-                    } else if (signalSide === 'SHORT' && shortPos.size < baseSize * 2) {
-                      await addSize(shortPos, additionalSize, `Add 0.5x to Short (Recovery Mode)`, freshSignal.id);
+                  if (!actionTaken && isLongLoss && isShortLoss && setting.add05Mode && wallet.freeMargin > 0) {
+                    if (isAmbiguous) {
+                      riskOverride = 'AMBIGUITY_BLOCK';
+                      console.log(`[PAPER] Recovery expansion blocked due to AMBIGUOUS signal metadata for ${symbol}`);
+                    } else if (isAdverseMoveBlocked) {
+                      riskOverride = 'ADVERSE_MOVE_BLOCK';
+                      console.log(`[PAPER] Recovery expansion blocked due to adverse spot move > 4% for ${symbol}`);
+                    } else {
+                      if (signalSide === 'LONG' && longPos.size < baseSize * 2) {
+                        const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, longPos.id, additionalSize, currentPrice, LEVERAGE);
+                        if (projectedMr < 25) {
+                          await addSize(longPos, additionalSize, `Add 0.5x to Long (Recovery Mode)`, freshSignal.id);
+                          longPos.size += additionalSize;
+                          actionTaken = true;
+                        } else {
+                          riskOverride = 'MR_BLOCK';
+                        }
+                      } else if (signalSide === 'SHORT' && shortPos.size < baseSize * 2) {
+                        const projectedMr = computeMRProjectedAfterAdd(wallet, openPositions, shortPos.id, additionalSize, currentPrice, LEVERAGE);
+                        if (projectedMr < 25) {
+                          await addSize(shortPos, additionalSize, `Add 0.5x to Short (Recovery Mode)`, freshSignal.id);
+                          shortPos.size += additionalSize;
+                          actionTaken = true;
+                        } else {
+                          riskOverride = 'MR_BLOCK';
+                        }
+                      }
                     }
+                  }
+                  
+                  // Post-Action Reclassification (SOP 6.6)
+                  if (actionTaken || riskOverride !== 'NONE') {
+                    const reclass = reclassifyState(longPos, shortPos, currentPrice);
+                    console.log(`[PAPER] Post-Action Reclass for ${symbol}: Structure=${reclass.structure}, GreenLeg=${reclass.greenLeg}, HedgeStatus=${reclass.hedgeLegStatus}, RiskOverride=${riskOverride}`);
+                    (freshSignal as any).reclass = reclass;
+                    (freshSignal as any).riskOverride = riskOverride;
                   }
                 }
               }
@@ -3006,6 +3320,8 @@ async function runPaperTradingEngine() {
 
   } catch (error) {
     console.error('[PAPER] Engine Error:', error);
+  } finally {
+    isPaperEngineRunning = false;
   }
 }
 
@@ -4099,7 +4415,7 @@ async function generateAiReply(userMessage: string, chatId: string = 'default', 
     SECTION 1 – RUANG LINGKUP PENERAPAN STRATEGI
     Strategi ini HANYA boleh diterapkan pada:
     1) TRADING BARU (fresh signal),
-    2) TRADING LAMA dengan syarat pergerakan harga spot (real spot price) yang melawan posisi maksimal 4%. Jika pergerakan spot > 4% → Masuk Mode WAIT and SEE → fokus reduce/lock saja. (Ingat: 4% ini dari harga spot, BUKAN dari Margin Ratio).
+    2) TRADING LAMA dengan syarat pergerakan harga spot (real spot price) yang melawan posisi maksimal 4%. Jika pergerakan spot > 4% → Masuk Mode WAIT and SEE → fokus reduce/lock saja.
     Aturan global: MR ideal: < 15%, MR guardrail keras: 25%.
 
     SECTION 2 – DEFINISI OPERASIONAL
@@ -4111,10 +4427,21 @@ async function generateAiReply(userMessage: string, chatId: string = 'default', 
     6. Struktur 2:1: Hanya digunakan ketika trend kuat dan jelas, MR < 15%.
     7. Gap 4% / Lock Trigger: Batas toleransi pergerakan harga spot (real spot price) yang melawan posisi, BUKAN persentase Margin Ratio.
 
+    SECTION 2C – CONTEXT MODE RESMI (WAJIB)
+    1) CONTINUATION_RECOVERY: Leg profit searah trend dominan. Fokus: ADD 0.5, kejar BEP, EXIT penuh.
+    2) REVERSAL_DEFENSE: Leg profit terancam reversal. Fokus: REDUCE bertahap leg hijau, kembali ke Lock 1:1.
+    3) LOCK_WAIT_SEE: Lock 1:1, ambigu, atau belum ada konfirmasi. Fokus: observasi, jaga MR.
+    4) EXIT_READY: Struktur 2:1 mendekati target BEP. Fokus: EXIT penuh kedua kaki.
+    5) RISK_DENIED: Aksi diblok guardrail (MR > 25%, ambigu, dll). Fokus: defensif.
+
     SECTION 3 – PARAMETER RISIKO GLOBAL
     - MRGlobal < 15% → kondisi aman.
     - MRGlobal 15–25% → zona waspada (fokus pengurangan risiko).
     - MRGlobal ≥ 25% → keadaan darurat (DILARANG ekspansi, hanya reduce/lock/TP).
+
+    SECTION 3B – LOCK_EXIT_URGENCY (MARGIN-AWARE OVERRIDE) (WAJIB)
+    Dalam Cross Margin Hedge Mode, LOCK 1:1 membekukan PnL net namun tidak membekukan Margin Ratio.
+    Jika Structure = LOCK_1TO1 dan MarginBleedRisk = HIGH serta (MRNow >= 23% atau MRProjected_Up2 >= 25%), dan PrimaryTrend4H = UP dengan TrendStatus = CONTINUATION_CONFIRMED, serta leg LONG dalam kondisi profit (hijau), maka Sentinel BOLEH melakukan ADD_LONG_0.5 secara konservatif pada zona Smart Money Concept (Bullish FVG, Bullish Order Block, atau Demand tervalidasi) untuk mengubah struktur menjadi LONG_2_SHORT_1. Aksi ini HANYA boleh dilakukan jika MRProjected_after_add tetap < 25% dan tidak melanggar guardrail ambigu, CHOP, atau RECOVERY_SUSPENDED. REDUCE atau CUT pada leg merah tetap DILARANG sesuai Golden Rule.
 
     SECTION 4 – WORKFLOW A: TRADE BARU
     - Entry hanya 1 posisi awal searah Bias4H.
@@ -4151,10 +4478,19 @@ async function generateAiReply(userMessage: string, chatId: string = 'default', 
     - RUMUS BEP 2:1 = ((Qty_Long * Entry_Long) - (Qty_Short * Entry_Short)) / (Qty_Long - Qty_Short)
     - Setelah exit penuh dengan net profit, WAJIB masuk ke mode WAIT & SEE (reset) dan cari peluang baru (fresh posisi).
 
-    SECTION 9 – PRIORITAS MULTI-PAIR
+    SECTION 9 – RULE PRECEDENCE / HIRARKI KEPUTUSAN (WAJIB)
+    1. GOLDEN RULE: No cut loss on red leg. Reduce hanya pada leg hijau. Unlock hanya jika hedge leg profit.
+    2. MR HARD GUARD: Jika MRProjected > 25%, ekspansi DILARANG.
+    3. NO EXPANSION IF AMBIGUOUS: Jika trend/struktur tidak jelas, DILARANG ekspansi.
+    3A. SPOT ADVERSE MOVE HARD BLOCK: Jika spot melawan posisi > 4% pada legacy trade, ekspansi DILARANG.
+    3B. LOCK_EXIT_URGENCY: Margin-aware override untuk ADD 0.5 pada LOCK 1:1 jika MR tinggi & trend kuat.
+    4. RECOVERY_SUSPENDED / DEAD MARKET: Blok ekspansi jika market tidak recoverable.
+    5. CONTEXT MODE + TREND STATUS: Penilaian akhir setelah seluruh guardrail lolos.
+
+    SECTION 10 – PRIORITAS MULTI-PAIR
     - Prioritaskan pair dengan MRProjected tertinggi, pergerakan spot melawan posisi mendekati 4%, atau floating loss terbesar berlawanan Bias4H.
 
-    SECTION 10 – PRINSIP FILOSOFIS
+    SECTION 11 – PRINSIP FILOSOFIS
     - Hedging adalah pengganti stop loss untuk membekukan risiko.
     - Fokus utama: Kontrol MR, struktur bersih, add kecil, exit penuh searah trend, reset.
 
@@ -4558,7 +4894,7 @@ async function startServer() {
            for (const p of cachedPaperPositions) {
              if (p.status === 'OPEN') {
                totalUnrealized += p.currentPnl !== undefined ? p.currentPnl : (p.unrealizedPnl || 0);
-               totalMarginUsed += (p.size * p.entryPrice) / 20; // Assuming 20x leverage
+               totalMarginUsed += calculateMarginUsed(p, 20); // Assuming 20x leverage
              }
            }
            cachedPaperWallet.equity = cachedPaperWallet.balance + totalUnrealized;

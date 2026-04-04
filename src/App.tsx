@@ -116,6 +116,16 @@ export default function App() {
   const [syncMessage, setSyncMessage] = useState<{text: string, type: 'success' | 'error'} | null>(null);
   const [isArchiving, setIsArchiving] = useState(false);
   const [archiveMessage, setArchiveMessage] = useState<{ text: string, type: 'success' | 'error' } | null>(null);
+  const [loginError, setLoginError] = useState<string | null>(null);
+
+  const handleLogin = async () => {
+    setLoginError(null);
+    try {
+      await loginWithGoogle();
+    } catch (error: any) {
+      setLoginError(error.message || "Failed to sign in with Google.");
+    }
+  };
 
   if (appError) {
     throw appError;
@@ -451,8 +461,18 @@ export default function App() {
           </div>
           <h1 className="text-2xl font-bold mb-2">Crypto Sentinel</h1>
           <p className="text-zinc-400 mb-8">Login to access your trading dashboard and AI assistant.</p>
+          
+          {loginError && (
+            <div className="mb-6 p-4 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400 text-sm text-left">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
+                <p>{loginError}</p>
+              </div>
+            </div>
+          )}
+
           <button 
-            onClick={loginWithGoogle}
+            onClick={handleLogin}
             className="w-full flex items-center justify-center gap-3 bg-white text-zinc-900 hover:bg-zinc-100 font-medium py-3 px-4 rounded-xl transition-colors"
           >
             <svg className="w-5 h-5" viewBox="0 0 24 24">

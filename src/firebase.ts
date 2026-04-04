@@ -14,8 +14,11 @@ export const googleProvider = new GoogleAuthProvider();
 export const loginWithGoogle = async () => {
   try {
     await signInWithPopup(auth, googleProvider);
-  } catch (error) {
+  } catch (error: any) {
     console.error("Error signing in with Google", error);
+    if (error?.code === 'auth/network-request-failed') {
+      throw new Error("Network request failed. This often happens if you are using an ad blocker, if third-party cookies are blocked in this iframe, or if the domain is not authorized. Try opening the app in a new tab or disabling your ad blocker.");
+    }
     throw error;
   }
 };

@@ -223,10 +223,18 @@ export default function App() {
         const res = await fetch('/api/signals');
         if (res.ok) {
           const data = await res.json();
-          setSignals(data);
+          // Ensure data is an array, especially if API returns a degraded object
+          if (Array.isArray(data)) {
+            setSignals(data);
+          } else if (data && data.degraded && Array.isArray(data.data)) {
+            setSignals(data.data);
+          } else {
+            setSignals([]);
+          }
         }
       } catch (e) {
         console.error("Error fetching signals", e);
+        setSignals([]);
       }
     };
     
@@ -249,10 +257,17 @@ export default function App() {
         const res = await fetch('/api/chats');
         if (res.ok) {
           const data = await res.json();
-          setChatMessages(data.map((c: any) => ({ role: c.role, content: c.content })));
+          if (Array.isArray(data)) {
+            setChatMessages(data.map((c: any) => ({ role: c.role, content: c.content })));
+          } else if (data && data.degraded && Array.isArray(data.data)) {
+            setChatMessages(data.data.map((c: any) => ({ role: c.role, content: c.content })));
+          } else {
+            setChatMessages([]);
+          }
         }
       } catch (e) {
         console.error("Error fetching chats", e);
+        setChatMessages([]);
       }
     };
 

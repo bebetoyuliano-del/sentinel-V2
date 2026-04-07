@@ -222,8 +222,21 @@ function deriveRequestedAction(args: {
   }
 
   if (structure === 'LOCK_1TO1') {
-    if (signalSide === 'LONG') return 'ADD_0.5_LONG';
-    return 'ADD_0.5_SHORT';
+    const trend = normalizePrimaryTrend4H(freshSignal);
+    const trendStatus = normalizeTrendStatus(freshSignal);
+    
+    // Continuation add harus searah GreenLeg dan trend dominan
+    // Jika tidak sinkron/ambigu, jatuh ke HOLD / defensive posture
+    if (trendStatus === 'CONTINUATION_CONFIRMED') {
+      if (signalSide === 'LONG' && greenLeg === 'LONG' && trend === 'UP') {
+        return 'ADD_0.5_LONG';
+      }
+      if (signalSide === 'SHORT' && greenLeg === 'SHORT' && trend === 'DOWN') {
+        return 'ADD_0.5_SHORT';
+      }
+    }
+    
+    return 'HOLD';
   }
 
   if (structure === 'LONG_1P5_SHORT_1' || structure === 'LONG_2_SHORT_1') {

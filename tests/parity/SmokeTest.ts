@@ -8,8 +8,8 @@ console.log("[SMOKE A] CANONICAL PARITY PATH");
 console.log("==================================================");
 
 const walletA = { marginRatio: 10, equity: 10000, balance: 10000 };
-const longPosA = { size: 1, currentPnl: -50, entryPrice: 61000 };
-const shortPosA = { size: 1, currentPnl: 50, entryPrice: 60000 };
+const longPosA = { size: 1, currentPnl: 50, entryPrice: 60000 };
+const shortPosA = { size: 1, currentPnl: -50, entryPrice: 61000 };
 const freshSignalA = {
   side: 'BUY',
   trend: { primary4H: 'UP', status: 'CONTINUATION_CONFIRMED' },

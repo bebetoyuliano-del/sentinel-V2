@@ -5,7 +5,7 @@ import type { PaperPosition, PaperWallet, PaperHistory } from './src/paper-engin
 import { calculateMarginUsed, computeMRProjectedAfterAdd } from './src/paper-engine/valuation';
 import { isParityV2Mode, evaluateParityPaper } from './src/paper-engine/parity_runtime';
 import { executeParityPaperDecision } from './src/paper-engine/parity_execute';
-import { withFirestoreFailSoft, jsonDegraded, markFirestoreUnavailable } from './src/paper-engine/firestore_failsoft';
+import { withFirestoreFailSoft, jsonDegraded, markFirestoreUnavailable, getFirestoreFailsoftStatus } from './src/paper-engine/firestore_failsoft';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import axios from 'axios';
 import ccxt from 'ccxt';
@@ -625,6 +625,15 @@ let isPaperTradingRunning = false;
 let paperTradingInterval: NodeJS.Timeout | null = null;
 let latestDecisionCards: any[] = [];
 let paperTradingResetTime = 0;
+
+// Paper Trading Session Metadata
+let paperSessionStart: string | null = null;
+let paperLastTick: string | null = null;
+let paperLastDecisionAt: string | null = null;
+let paperLastSkipReason: string | null = null;
+let paperSkippedCycles = 0;
+let paperNoSignalCycles = 0;
+let paperNoPositionCycles = 0;
 
 // Helper to send Telegram message
 // Extracted to src/services/TelegramService.ts
@@ -1521,10 +1530,18 @@ async function runPaperTradingEngine() {
       ...freshSignals.map(s => s.symbol)
     ])).filter(Boolean);
 
+    paperLastTick = new Date().toISOString();
+
     if (symbolsToProcess.length === 0) {
       console.log('[PAPER] No open positions or fresh signals. Skipping cycle.');
+      paperSkippedCycles++;
+      if (openPositions.length === 0) paperNoPositionCycles++;
+      if (freshSignals.length === 0) paperNoSignalCycles++;
+      paperLastSkipReason = 'No open positions or fresh signals';
       return;
     }
+
+    paperLastSkipReason = null;
 
     // Recalculate equity and free margin to fix any inconsistencies
     let totalUnrealized = 0;
@@ -1997,8 +2014,11 @@ async function runPaperTradingEngine() {
             })}`
           );
 
+          const decisionTs = new Date().toISOString();
+          paperLastDecisionAt = decisionTs;
+
           cachedPaperDecisions.unshift({
-            ts: new Date().toISOString(),
+            ts: decisionTs,
             symbol,
             price: currentPrice,
             PrimaryTrend4H: inputState.market.PrimaryTrend4H,
@@ -3146,6 +3166,7 @@ app.post('/api/paper/toggle', async (req, res) => {
     res.json({ isPaperTradingRunning });
   } else {
     try {
+      paperSessionStart = new Date().toISOString();
       await runPaperTradingEngine();
       paperTradingInterval = setInterval(() => {
         runPaperTradingEngine().catch(console.error);
@@ -3240,11 +3261,18 @@ app.get('/api/paper/session-review', async (req, res) => {
   try {
     await ensureAuth();
     
+    const failsoftStatus = getFirestoreFailsoftStatus();
+    
     const summary = {
       sessionMetadata: {
         timestamp: new Date().toISOString(),
         mode: 'PAPER_TRADING',
-        parityVersion: 'v2',
+        paperEngineMode: isParityV2Mode() ? 'parity_v2' : 'legacy',
+        engineStatus: isPaperTradingRunning ? 'RUNNING' : 'STOPPED',
+        sessionStart: paperSessionStart,
+        lastTick: paperLastTick,
+        lastDecisionAt: paperLastDecisionAt,
+        lastSkipReason: paperLastSkipReason,
         firestoreStatus: db ? 'CONNECTED' : 'DEGRADED',
       },
       runtimeActionCounts: {
@@ -3252,6 +3280,9 @@ app.get('/api/paper/session-review', async (req, res) => {
         executed: cachedPaperDecisions.filter(d => d.executionResult === 'EXECUTED').length,
         skipped: cachedPaperDecisions.filter(d => d.executionResult === 'SKIPPED').length,
         blocked: cachedPaperDecisions.filter(d => d.why_blocked).length,
+        skippedCycles: paperSkippedCycles,
+        noSignalCycles: paperNoSignalCycles,
+        noPositionCycles: paperNoPositionCycles,
       },
       blockCounts: {
         mr: cachedPaperDecisions.filter(d => d.why_blocked?.includes('MR')).length,
@@ -3261,7 +3292,10 @@ app.get('/api/paper/session-review', async (req, res) => {
       },
       pairLevelSamples: cachedPaperDecisions.slice(0, 10), // Top 10 recent
       degradedModeStats: {
-        isDegraded: !db,
+        isDegraded: !db || failsoftStatus.degradedModeActive,
+        firestoreAvailable: failsoftStatus.firestoreAvailable,
+        degradedModeActive: failsoftStatus.degradedModeActive,
+        cooldownUntil: failsoftStatus.cooldownUntil
       },
       auditTrailCompleteness: '100%',
       scenarioCoverage: {

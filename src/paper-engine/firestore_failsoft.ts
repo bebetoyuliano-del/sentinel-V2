@@ -14,6 +14,14 @@ export function isFirestoreTemporarilyUnavailable(): boolean {
   return Date.now() < firestoreUnavailableUntil;
 }
 
+export function getFirestoreFailsoftStatus() {
+  return {
+    firestoreAvailable: !isFirestoreTemporarilyUnavailable(),
+    degradedModeActive: isFirestoreTemporarilyUnavailable(),
+    cooldownUntil: firestoreUnavailableUntil > 0 ? new Date(firestoreUnavailableUntil).toISOString() : null
+  };
+}
+
 export function markFirestoreUnavailable(ms = 60_000): void {
   firestoreUnavailableUntil = Date.now() + ms;
 }

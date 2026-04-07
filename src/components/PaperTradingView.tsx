@@ -432,7 +432,22 @@ export default function PaperTradingView() {
                   {decisions.length === 0 ? (
                     <tr>
                       <td colSpan={7} className="px-4 py-8 text-center text-slate-500">
-                        No parity decisions recorded yet
+                        {sessionSummary?.sessionMetadata?.engineStatus === 'RUNNING' ? (
+                          <div className="flex flex-col items-center gap-2">
+                            <div className="flex items-center gap-2 text-emerald-400">
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                              <span>Engine is running...</span>
+                            </div>
+                            <div className="text-xs text-slate-400">
+                              Last Tick: {sessionSummary?.sessionMetadata?.lastTick ? new Date(sessionSummary.sessionMetadata.lastTick).toLocaleTimeString() : 'Waiting...'}
+                            </div>
+                            <div className="text-xs text-slate-500">
+                              {sessionSummary?.sessionMetadata?.lastSkipReason || 'Waiting for first cycle'}
+                            </div>
+                          </div>
+                        ) : (
+                          'No parity decisions recorded yet'
+                        )}
                       </td>
                     </tr>
                   ) : (
@@ -489,8 +504,12 @@ export default function PaperTradingView() {
               <h3 className="text-lg font-semibold text-white mb-4">Session Metadata</h3>
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between"><span className="text-slate-400">Mode:</span> <span className="text-white">{sessionSummary.sessionMetadata.mode}</span></div>
-                <div className="flex justify-between"><span className="text-slate-400">Parity Version:</span> <span className="text-white">{sessionSummary.sessionMetadata.parityVersion}</span></div>
-                <div className="flex justify-between"><span className="text-slate-400">Firestore Status:</span> <span className={sessionSummary.sessionMetadata.firestoreStatus === 'CONNECTED' ? 'text-emerald-400' : 'text-yellow-400'}>{sessionSummary.sessionMetadata.firestoreStatus}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Paper Engine Mode:</span> <span className="text-white">{sessionSummary.sessionMetadata.paperEngineMode}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Engine Status:</span> <span className={sessionSummary.sessionMetadata.engineStatus === 'RUNNING' ? 'text-emerald-400' : 'text-slate-400'}>{sessionSummary.sessionMetadata.engineStatus}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Session Start:</span> <span className="text-white">{sessionSummary.sessionMetadata.sessionStart ? new Date(sessionSummary.sessionMetadata.sessionStart).toLocaleString() : 'N/A'}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Last Tick:</span> <span className="text-white">{sessionSummary.sessionMetadata.lastTick ? new Date(sessionSummary.sessionMetadata.lastTick).toLocaleString() : 'N/A'}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Last Decision At:</span> <span className="text-white">{sessionSummary.sessionMetadata.lastDecisionAt ? new Date(sessionSummary.sessionMetadata.lastDecisionAt).toLocaleString() : 'N/A'}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Last Skip Reason:</span> <span className="text-slate-300 truncate max-w-[200px]" title={sessionSummary.sessionMetadata.lastSkipReason || 'N/A'}>{sessionSummary.sessionMetadata.lastSkipReason || 'N/A'}</span></div>
                 <div className="flex justify-between"><span className="text-slate-400">Scope Safety:</span> <span className="text-emerald-400">{sessionSummary.scopeSafetySummary}</span></div>
               </div>
             </div>
@@ -500,8 +519,12 @@ export default function PaperTradingView() {
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between"><span className="text-slate-400">Total Decisions:</span> <span className="text-white">{sessionSummary.runtimeActionCounts.total}</span></div>
                 <div className="flex justify-between"><span className="text-slate-400">Executed:</span> <span className="text-emerald-400">{sessionSummary.runtimeActionCounts.executed}</span></div>
-                <div className="flex justify-between"><span className="text-slate-400">Skipped:</span> <span className="text-slate-300">{sessionSummary.runtimeActionCounts.skipped}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Skipped (Decisions):</span> <span className="text-slate-300">{sessionSummary.runtimeActionCounts.skipped}</span></div>
                 <div className="flex justify-between"><span className="text-slate-400">Blocked:</span> <span className="text-red-400">{sessionSummary.runtimeActionCounts.blocked}</span></div>
+                <div className="my-2 border-t border-slate-700/50"></div>
+                <div className="flex justify-between"><span className="text-slate-400">Skipped Cycles:</span> <span className="text-yellow-400">{sessionSummary.runtimeActionCounts.skippedCycles || 0}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">No-Signal Cycles:</span> <span className="text-slate-400">{sessionSummary.runtimeActionCounts.noSignalCycles || 0}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">No-Position Cycles:</span> <span className="text-slate-400">{sessionSummary.runtimeActionCounts.noPositionCycles || 0}</span></div>
               </div>
             </div>
             
@@ -515,6 +538,15 @@ export default function PaperTradingView() {
               </div>
             </div>
             
+            <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-6">
+              <h3 className="text-lg font-semibold text-white mb-4">Degraded Mode Stats</h3>
+              <div className="space-y-2 text-sm">
+                <div className="flex justify-between"><span className="text-slate-400">Firestore Available:</span> <span className={sessionSummary.degradedModeStats.firestoreAvailable ? 'text-emerald-400' : 'text-red-400'}>{sessionSummary.degradedModeStats.firestoreAvailable ? 'YES' : 'NO'}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Degraded Mode Active:</span> <span className={sessionSummary.degradedModeStats.degradedModeActive ? 'text-yellow-400' : 'text-slate-400'}>{sessionSummary.degradedModeStats.degradedModeActive ? 'YES' : 'NO'}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Cooldown Until:</span> <span className="text-white">{sessionSummary.degradedModeStats.cooldownUntil ? new Date(sessionSummary.degradedModeStats.cooldownUntil).toLocaleString() : 'N/A'}</span></div>
+              </div>
+            </div>
+
             <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-6">
               <h3 className="text-lg font-semibold text-white mb-4">Export</h3>
               <p className="text-sm text-slate-400 mb-4">Export this session summary to fill out your review template.</p>
@@ -538,19 +570,32 @@ export default function PaperTradingView() {
 # Paper Trading Session Review
 **Date:** ${new Date().toISOString().split('T')[0]}
 **Mode:** ${sessionSummary.sessionMetadata.mode}
-**Parity Version:** ${sessionSummary.sessionMetadata.parityVersion}
+**Paper Engine Mode:** ${sessionSummary.sessionMetadata.paperEngineMode}
+**Engine Status:** ${sessionSummary.sessionMetadata.engineStatus}
+**Session Start:** ${sessionSummary.sessionMetadata.sessionStart ? new Date(sessionSummary.sessionMetadata.sessionStart).toLocaleString() : 'N/A'}
+**Last Tick:** ${sessionSummary.sessionMetadata.lastTick ? new Date(sessionSummary.sessionMetadata.lastTick).toLocaleString() : 'N/A'}
+**Last Decision At:** ${sessionSummary.sessionMetadata.lastDecisionAt ? new Date(sessionSummary.sessionMetadata.lastDecisionAt).toLocaleString() : 'N/A'}
+**Last Skip Reason:** ${sessionSummary.sessionMetadata.lastSkipReason || 'N/A'}
 
 ## Runtime Action Counts
 - Total Decisions: ${sessionSummary.runtimeActionCounts.total}
 - Executed: ${sessionSummary.runtimeActionCounts.executed}
-- Skipped: ${sessionSummary.runtimeActionCounts.skipped}
+- Skipped (Decisions): ${sessionSummary.runtimeActionCounts.skipped}
 - Blocked: ${sessionSummary.runtimeActionCounts.blocked}
+- Skipped Cycles: ${sessionSummary.runtimeActionCounts.skippedCycles}
+- No-Signal Cycles: ${sessionSummary.runtimeActionCounts.noSignalCycles}
+- No-Position Cycles: ${sessionSummary.runtimeActionCounts.noPositionCycles}
 
 ## Guardrail Blocks
 - Margin Ratio (MR): ${sessionSummary.blockCounts.mr}
 - Ambiguity: ${sessionSummary.blockCounts.ambiguity}
 - Chop / Recovery Suspended: ${sessionSummary.blockCounts.chop}
 - Golden Rule: ${sessionSummary.blockCounts.goldenRule}
+
+## Degraded Mode Stats
+- Firestore Available: ${sessionSummary.degradedModeStats.firestoreAvailable ? 'YES' : 'NO'}
+- Degraded Mode Active: ${sessionSummary.degradedModeStats.degradedModeActive ? 'YES' : 'NO'}
+- Cooldown Until: ${sessionSummary.degradedModeStats.cooldownUntil ? new Date(sessionSummary.degradedModeStats.cooldownUntil).toLocaleString() : 'N/A'}
 
 ## Scope Safety
 ${sessionSummary.scopeSafetySummary}

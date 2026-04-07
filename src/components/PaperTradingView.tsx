@@ -7,6 +7,8 @@ export default function PaperTradingView() {
   const [positions, setPositions] = useState<any[]>([]);
   const [history, setHistory] = useState<any[]>([]);
   const [monitoring, setMonitoring] = useState<any[]>([]);
+  const [decisions, setDecisions] = useState<any[]>([]);
+  const [sessionSummary, setSessionSummary] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isResetting, setIsResetting] = useState(false);
@@ -14,12 +16,14 @@ export default function PaperTradingView() {
 
   const fetchData = async () => {
     try {
-      const [statusRes, walletRes, posRes, histRes, monitorRes] = await Promise.all([
+      const [statusRes, walletRes, posRes, histRes, monitorRes, decisionsRes, summaryRes] = await Promise.all([
         fetch('/api/paper/status'),
         fetch('/api/paper/wallet'),
         fetch('/api/paper/positions'),
         fetch('/api/paper/history'),
-        fetch('/api/paper/monitoring')
+        fetch('/api/paper/monitoring'),
+        fetch('/api/paper/decisions'),
+        fetch('/api/paper/session-review')
       ]);
 
       const status = await statusRes.json();
@@ -27,6 +31,8 @@ export default function PaperTradingView() {
       const posData = await posRes.json();
       const histData = await histRes.json();
       const monitorData = await monitorRes.json();
+      const decisionsData = await decisionsRes.json();
+      const summaryData = await summaryRes.json();
 
       if (!statusRes.ok) throw new Error(status.error || 'Failed to fetch status');
       if (!walletRes.ok) throw new Error(walletData.error || 'Failed to fetch wallet');
@@ -39,6 +45,8 @@ export default function PaperTradingView() {
       setPositions(Array.isArray(posData) ? posData : []);
       setHistory(Array.isArray(histData) ? histData.sort((a: any, b: any) => new Date(b.closedAt).getTime() - new Date(a.closedAt).getTime()) : []);
       setMonitoring(Array.isArray(monitorData) ? monitorData : []);
+      setDecisions(Array.isArray(decisionsData) ? decisionsData : []);
+      setSessionSummary(summaryData);
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -84,6 +92,9 @@ export default function PaperTradingView() {
       setIsResetting(false);
     }
   };
+
+  const [activeTab, setActiveTab] = useState<'overview' | 'decisions' | 'review'>('overview');
+  const [selectedDecision, setSelectedDecision] = useState<any>(null);
 
   if (loading) {
     return <div className="flex items-center justify-center h-64 text-slate-400">Loading paper trading data...</div>;
@@ -138,7 +149,37 @@ export default function PaperTradingView() {
         </div>
       )}
 
-      {/* Wallet Stats */}
+      {/* Tabs */}
+      <div className="flex gap-4 border-b border-slate-700/50 pb-2">
+        <button
+          onClick={() => setActiveTab('overview')}
+          className={`px-4 py-2 font-medium text-sm rounded-lg transition-colors ${
+            activeTab === 'overview' ? 'bg-slate-800 text-white' : 'text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          Overview
+        </button>
+        <button
+          onClick={() => setActiveTab('decisions')}
+          className={`px-4 py-2 font-medium text-sm rounded-lg transition-colors ${
+            activeTab === 'decisions' ? 'bg-slate-800 text-white' : 'text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          Parity Decisions
+        </button>
+        <button
+          onClick={() => setActiveTab('review')}
+          className={`px-4 py-2 font-medium text-sm rounded-lg transition-colors ${
+            activeTab === 'review' ? 'bg-slate-800 text-white' : 'text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          Session Review
+        </button>
+      </div>
+
+      {activeTab === 'overview' && (
+        <div className="space-y-6">
+          {/* Wallet Stats */}
       <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
         <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-4">
           <div className="flex items-center gap-2 text-slate-400 mb-2">
@@ -359,6 +400,304 @@ export default function PaperTradingView() {
           </table>
         </div>
       </div>
+      </div>
+      )}
+
+      {activeTab === 'decisions' && (
+        <div className="space-y-6">
+          <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl overflow-hidden">
+            <div className="p-4 border-b border-slate-700/50 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Target className="w-5 h-5 text-blue-400" />
+                <h3 className="font-semibold text-white">Parity Decisions Feed</h3>
+              </div>
+              <div className="text-xs text-slate-400">
+                Total: {decisions.length} | Executed: {decisions.filter(d => d.executionResult === 'EXECUTED').length} | Blocked: {decisions.filter(d => d.why_blocked).length}
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm text-left">
+                <thead className="text-xs text-slate-400 uppercase bg-slate-900/50">
+                  <tr>
+                    <th className="px-4 py-3">Time</th>
+                    <th className="px-4 py-3">Symbol</th>
+                    <th className="px-4 py-3">Context</th>
+                    <th className="px-4 py-3">Requested</th>
+                    <th className="px-4 py-3">Final Action</th>
+                    <th className="px-4 py-3">Result</th>
+                    <th className="px-4 py-3">Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {decisions.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="px-4 py-8 text-center text-slate-500">
+                        No parity decisions recorded yet
+                      </td>
+                    </tr>
+                  ) : (
+                    decisions.map((d, i) => (
+                      <tr 
+                        key={i} 
+                        onClick={() => setSelectedDecision(d)}
+                        className="border-b border-slate-700/50 last:border-0 hover:bg-slate-800/30 cursor-pointer"
+                      >
+                        <td className="px-4 py-3 text-slate-400 text-xs">
+                          {new Date(d.ts).toLocaleTimeString()}
+                        </td>
+                        <td className="px-4 py-3 font-medium text-white">{d.symbol}</td>
+                        <td className="px-4 py-3 text-xs">
+                          <div className="text-slate-300">Mode: {d.ContextMode}</div>
+                          <div className="text-slate-500">Struct: {d.Structure}</div>
+                        </td>
+                        <td className="px-4 py-3 text-slate-300">{d.requested_action}</td>
+                        <td className="px-4 py-3">
+                          <span className={`px-2 py-1 rounded text-xs font-medium ${
+                            d.final_action.includes('LONG') ? 'bg-emerald-500/10 text-emerald-500' : 
+                            d.final_action.includes('SHORT') ? 'bg-red-500/10 text-red-500' : 
+                            'bg-slate-500/10 text-slate-400'
+                          }`}>
+                            {d.final_action}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className={`px-2 py-1 rounded text-xs font-medium ${
+                            d.executionResult === 'EXECUTED' ? 'bg-emerald-500/10 text-emerald-500' : 
+                            d.executionResult === 'BLOCKED' ? 'bg-red-500/10 text-red-500' : 
+                            'bg-slate-500/10 text-slate-400'
+                          }`}>
+                            {d.executionResult}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-xs text-slate-400 max-w-xs truncate" title={d.why_blocked || d.why_allowed || '-'}>
+                          {d.why_blocked || d.why_allowed || '-'}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'review' && sessionSummary && (
+        <div className="space-y-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-6">
+              <h3 className="text-lg font-semibold text-white mb-4">Session Metadata</h3>
+              <div className="space-y-2 text-sm">
+                <div className="flex justify-between"><span className="text-slate-400">Mode:</span> <span className="text-white">{sessionSummary.sessionMetadata.mode}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Parity Version:</span> <span className="text-white">{sessionSummary.sessionMetadata.parityVersion}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Firestore Status:</span> <span className={sessionSummary.sessionMetadata.firestoreStatus === 'CONNECTED' ? 'text-emerald-400' : 'text-yellow-400'}>{sessionSummary.sessionMetadata.firestoreStatus}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Scope Safety:</span> <span className="text-emerald-400">{sessionSummary.scopeSafetySummary}</span></div>
+              </div>
+            </div>
+            
+            <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-6">
+              <h3 className="text-lg font-semibold text-white mb-4">Runtime Action Counts</h3>
+              <div className="space-y-2 text-sm">
+                <div className="flex justify-between"><span className="text-slate-400">Total Decisions:</span> <span className="text-white">{sessionSummary.runtimeActionCounts.total}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Executed:</span> <span className="text-emerald-400">{sessionSummary.runtimeActionCounts.executed}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Skipped:</span> <span className="text-slate-300">{sessionSummary.runtimeActionCounts.skipped}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Blocked:</span> <span className="text-red-400">{sessionSummary.runtimeActionCounts.blocked}</span></div>
+              </div>
+            </div>
+            
+            <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-6">
+              <h3 className="text-lg font-semibold text-white mb-4">Guardrail Blocks</h3>
+              <div className="space-y-2 text-sm">
+                <div className="flex justify-between"><span className="text-slate-400">Margin Ratio (MR):</span> <span className="text-yellow-400">{sessionSummary.blockCounts.mr}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Ambiguity:</span> <span className="text-yellow-400">{sessionSummary.blockCounts.ambiguity}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Chop / Recovery Suspended:</span> <span className="text-yellow-400">{sessionSummary.blockCounts.chop}</span></div>
+                <div className="flex justify-between"><span className="text-slate-400">Golden Rule:</span> <span className="text-yellow-400">{sessionSummary.blockCounts.goldenRule}</span></div>
+              </div>
+            </div>
+            
+            <div className="bg-slate-800/50 border border-slate-700/50 rounded-xl p-6">
+              <h3 className="text-lg font-semibold text-white mb-4">Export</h3>
+              <p className="text-sm text-slate-400 mb-4">Export this session summary to fill out your review template.</p>
+              <div className="flex gap-2">
+                <button 
+                  onClick={() => {
+                    const blob = new Blob([JSON.stringify(sessionSummary, null, 2)], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `session-review-${new Date().toISOString().split('T')[0]}.json`;
+                    a.click();
+                  }}
+                  className="px-4 py-2 bg-blue-500/20 text-blue-400 rounded-lg text-sm hover:bg-blue-500/30 transition-colors"
+                >
+                  Export JSON
+                </button>
+                <button 
+                  onClick={() => {
+                    const md = `
+# Paper Trading Session Review
+**Date:** ${new Date().toISOString().split('T')[0]}
+**Mode:** ${sessionSummary.sessionMetadata.mode}
+**Parity Version:** ${sessionSummary.sessionMetadata.parityVersion}
+
+## Runtime Action Counts
+- Total Decisions: ${sessionSummary.runtimeActionCounts.total}
+- Executed: ${sessionSummary.runtimeActionCounts.executed}
+- Skipped: ${sessionSummary.runtimeActionCounts.skipped}
+- Blocked: ${sessionSummary.runtimeActionCounts.blocked}
+
+## Guardrail Blocks
+- Margin Ratio (MR): ${sessionSummary.blockCounts.mr}
+- Ambiguity: ${sessionSummary.blockCounts.ambiguity}
+- Chop / Recovery Suspended: ${sessionSummary.blockCounts.chop}
+- Golden Rule: ${sessionSummary.blockCounts.goldenRule}
+
+## Scope Safety
+${sessionSummary.scopeSafetySummary}
+                    `.trim();
+                    const blob = new Blob([md], { type: 'text/markdown' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `session-review-${new Date().toISOString().split('T')[0]}.md`;
+                    a.click();
+                  }}
+                  className="px-4 py-2 bg-purple-500/20 text-purple-400 rounded-lg text-sm hover:bg-purple-500/30 transition-colors"
+                >
+                  Export Markdown
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Pair Detail Inspector Modal */}
+      {selectedDecision && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+            <div className="p-4 border-b border-slate-700 flex justify-between items-center sticky top-0 bg-slate-900">
+              <h3 className="text-lg font-bold text-white">Decision Inspector: {selectedDecision.symbol}</h3>
+              <button 
+                onClick={() => setSelectedDecision(null)}
+                className="text-slate-400 hover:text-white"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="p-6 space-y-6">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <div className="text-xs text-slate-500 mb-1">Timestamp</div>
+                  <div className="text-sm text-white">{new Date(selectedDecision.ts).toLocaleString()}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-slate-500 mb-1">Price</div>
+                  <div className="text-sm text-white">${selectedDecision.price}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-slate-500 mb-1">Primary Trend 4H</div>
+                  <div className="text-sm text-white">{selectedDecision.PrimaryTrend4H}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-slate-500 mb-1">Trend Status</div>
+                  <div className="text-sm text-white">{selectedDecision.TrendStatus}</div>
+                </div>
+              </div>
+
+              <div className="border-t border-slate-700 pt-4">
+                <h4 className="text-sm font-semibold text-slate-300 mb-3">Position Context</h4>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <div className="text-xs text-slate-500 mb-1">Structure</div>
+                    <div className="text-sm text-white">{selectedDecision.Structure}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-slate-500 mb-1">Context Mode</div>
+                    <div className="text-sm text-white">{selectedDecision.ContextMode}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-slate-500 mb-1">Green Leg</div>
+                    <div className="text-sm text-white">{selectedDecision.GreenLeg}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-slate-500 mb-1">Red Leg</div>
+                    <div className="text-sm text-white">{selectedDecision.RedLeg}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="border-t border-slate-700 pt-4">
+                <h4 className="text-sm font-semibold text-slate-300 mb-3">Decision Outcome</h4>
+                <div className="space-y-3">
+                  <div>
+                    <div className="text-xs text-slate-500 mb-1">Requested Action</div>
+                    <div className="text-sm text-white">{selectedDecision.requested_action}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-slate-500 mb-1">Final Action</div>
+                    <div className={`text-sm font-medium ${
+                      selectedDecision.final_action.includes('LONG') ? 'text-emerald-400' : 
+                      selectedDecision.final_action.includes('SHORT') ? 'text-red-400' : 'text-slate-300'
+                    }`}>
+                      {selectedDecision.final_action}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-slate-500 mb-1">Execution Result</div>
+                    <div className={`text-sm font-medium ${
+                      selectedDecision.executionResult === 'EXECUTED' ? 'text-emerald-400' : 
+                      selectedDecision.executionResult === 'BLOCKED' ? 'text-red-400' : 'text-slate-300'
+                    }`}>
+                      {selectedDecision.executionResult}
+                    </div>
+                  </div>
+                  {selectedDecision.why_blocked && (
+                    <div className="bg-red-500/10 border border-red-500/20 rounded p-3">
+                      <div className="text-xs text-red-500 mb-1">Block Reason</div>
+                      <div className="text-sm text-red-400">{selectedDecision.why_blocked}</div>
+                    </div>
+                  )}
+                  {selectedDecision.why_allowed && (
+                    <div className="bg-emerald-500/10 border border-emerald-500/20 rounded p-3">
+                      <div className="text-xs text-emerald-500 mb-1">Allow Reason</div>
+                      <div className="text-sm text-emerald-400">{selectedDecision.why_allowed}</div>
+                    </div>
+                  )}
+                </div>
+              </div>
+              
+              <div className="border-t border-slate-700 pt-4">
+                <h4 className="text-sm font-semibold text-slate-300 mb-3">Risk & Flags</h4>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <div className="text-xs text-slate-500 mb-1">Projected MR</div>
+                    <div className="text-sm text-white">{selectedDecision.MRProjected?.toFixed(2)}%</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-slate-500 mb-1">Recovery Suspended</div>
+                    <div className="text-sm text-white">{selectedDecision.recovery_suspended ? 'YES' : 'NO'}</div>
+                  </div>
+                  <div className="col-span-2">
+                    <div className="text-xs text-slate-500 mb-1">Ambiguity Flags</div>
+                    <div className="flex flex-wrap gap-2">
+                      {selectedDecision.ambiguity_flags?.length > 0 ? (
+                        selectedDecision.ambiguity_flags.map((flag: string, i: number) => (
+                          <span key={i} className="px-2 py-1 bg-yellow-500/10 text-yellow-500 text-xs rounded">
+                            {flag}
+                          </span>
+                        ))
+                      ) : (
+                        <span className="text-sm text-slate-400">None</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

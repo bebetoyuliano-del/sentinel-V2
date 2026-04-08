@@ -86,10 +86,46 @@ export class ParityAdapter {
 
     // 3. Ambiguity Gate
     if (!isBlocked && market.ambiguity_flags && market.ambiguity_flags.length > 0) {
-      if (currentAction !== "HOLD" && currentAction !== "LOCK_NEUTRAL" && !currentAction.startsWith("REDUCE")) {
+      const hasMissingSmc = market.ambiguity_flags.includes('MISSING_SMC_METADATA');
+      const hasSmcNotValidated = market.ambiguity_flags.includes('SMC_NOT_VALIDATED');
+      const supportCount = market.secondary_confirmation_count || 0;
+      
+      const otherFlags = market.ambiguity_flags.filter((f: string) => f !== 'SMC_NOT_VALIDATED');
+
+      let shouldBlock = false;
+      let blockReason = "AMBIGUOUS_MARKET";
+
+      if (hasMissingSmc) {
+        if (currentAction !== "HOLD" && currentAction !== "LOCK_NEUTRAL" && !currentAction.startsWith("REDUCE")) {
+          shouldBlock = true;
+          blockReason = "MISSING_SMC_METADATA";
+        }
+      } else if (otherFlags.length > 0) {
+        if (currentAction !== "HOLD" && currentAction !== "LOCK_NEUTRAL" && !currentAction.startsWith("REDUCE")) {
+          shouldBlock = true;
+          blockReason = otherFlags[0];
+        }
+      } else if (hasSmcNotValidated) {
+        const isFreshEntry = position.Structure === 'NONE' && (currentAction === 'OPEN_LONG' || currentAction === 'OPEN_SHORT');
+        const canPassFreshEntry =
+          isFreshEntry &&
+          market.TrendStatus === 'CONTINUATION_CONFIRMED' &&
+          supportCount >= 2;
+
+        if (!canPassFreshEntry) {
+          if (currentAction !== "HOLD" && currentAction !== "LOCK_NEUTRAL" && !currentAction.startsWith("REDUCE")) {
+            shouldBlock = true;
+            blockReason = "SMC_NOT_VALIDATED";
+          }
+        } else {
+          whyAllowed = "SMC present but not validated; support score passed";
+        }
+      }
+
+      if (shouldBlock) {
         result.blocked_actions.push(currentAction);
         currentAction = "HOLD";
-        whyBlocked = "AMBIGUOUS_MARKET";
+        whyBlocked = blockReason;
         riskOverride = "AMBIGUITY_BLOCK";
         isBlocked = true;
       }

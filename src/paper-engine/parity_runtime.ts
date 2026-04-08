@@ -181,6 +181,19 @@ function deriveHedgeState(
   return { HedgeLeg, HedgeLegStatus, ambiguityFlags };
 }
 
+function computeSecondaryConfirmationCount(signal: FreshSignalLike | null | undefined): number {
+  let count = 0;
+  if (!signal) return 0;
+
+  const confluence = (signal as any).confluence;
+  if (confluence?.rf_flip_ok === true) count++;
+  if (confluence?.wae_exploding === true) count++;
+  if (confluence?.rqk_ok === true) count++;
+  if (signal?.smc?.validated === true) count++;
+
+  return count;
+}
+
 function deriveRequestedAction(args: {
   structure: ParityStructure;
   freshSignal: FreshSignalLike | null | undefined;
@@ -192,6 +205,7 @@ function deriveRequestedAction(args: {
   redLeg: 'LONG' | 'SHORT' | 'NONE';
   longPos: RuntimePos | null | undefined;
   shortPos: RuntimePos | null | undefined;
+  supportCount: number;
 }): ParityAction {
   const {
     structure,
@@ -204,6 +218,7 @@ function deriveRequestedAction(args: {
     redLeg,
     longPos,
     shortPos,
+    supportCount,
   } = args;
 
   if (wallet.isEmergencyDeRisking) return 'HOLD';
@@ -218,7 +233,17 @@ function deriveRequestedAction(args: {
   const signalSide = String(freshSignal.side || '').toUpperCase() === 'BUY' ? 'LONG' : 'SHORT';
 
   if (structure === 'NONE') {
-    return signalSide === 'LONG' ? 'OPEN_LONG' : 'OPEN_SHORT';
+    const trend = normalizePrimaryTrend4H(freshSignal);
+    const trendStatus = normalizeTrendStatus(freshSignal);
+
+    if (
+      trendStatus === 'CONTINUATION_CONFIRMED' &&
+      ((signalSide === 'LONG' && trend === 'UP') || (signalSide === 'SHORT' && trend === 'DOWN'))
+    ) {
+      return signalSide === 'LONG' ? 'OPEN_LONG' : 'OPEN_SHORT';
+    }
+
+    return 'HOLD';
   }
 
   if (structure === 'LOCK_1TO1') {
@@ -297,6 +322,8 @@ export function buildParityInputState(args: BuildParityInputArgs) {
 
   ambiguity_flags.push(...hedgeAmbiguity);
 
+  const supportCount = computeSecondaryConfirmationCount(freshSignal);
+
   const requested_action = deriveRequestedAction({
     structure: Structure,
     freshSignal,
@@ -308,6 +335,7 @@ export function buildParityInputState(args: BuildParityInputArgs) {
     redLeg: RedLeg,
     longPos,
     shortPos,
+    supportCount,
   });
 
   // ContextMode sengaja tidak dibangun agresif di sini.
@@ -327,6 +355,7 @@ export function buildParityInputState(args: BuildParityInputArgs) {
       TrendStatus,
       ambiguity_flags,
       recovery_suspended: Boolean(wallet.isEmergencyDeRisking),
+      secondary_confirmation_count: supportCount,
     },
     position: {
       requested_action,
